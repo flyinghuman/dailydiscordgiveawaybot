@@ -167,6 +167,10 @@ class GiveawayBot(commands.Bot):
         await self.manager.handle_scheduled()
         self._scheduled_checker.start()
         await self.tree.sync()
+        dev_guild_id = self.config.permissions.development_guild_id
+        if dev_guild_id:
+            guild = discord.Object(dev_guild_id)
+            await self.tree.sync(guild=guild)
 
     @tasks.loop(minutes=1)
     async def _scheduled_checker(self) -> None:
@@ -282,6 +286,8 @@ def register_commands(bot: GiveawayBot) -> None:
         winners="Number of winners to draw.",
         title="Title for the giveaway embed.",
         description="Description for the giveaway.",
+        start="Start time in HH:MM (24h) to begin the giveaway.",
+        end="End time in HH:MM (24h) to finish the giveaway.",
     )
     async def giveaway_start(
         interaction: discord.Interaction,
@@ -289,6 +295,8 @@ def register_commands(bot: GiveawayBot) -> None:
         winners: app_commands.Range[int, 1, 100],
         title: str,
         description: str,
+        start: str,
+        end: str,
     ) -> None:
         error = await admin_required(interaction, manager)
         if error:
@@ -322,26 +330,65 @@ def register_commands(bot: GiveawayBot) -> None:
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
 
+        try:
+            start_hhmm = datetime.strptime(start.strip(), "%H:%M").time()
+            end_hhmm = datetime.strptime(end.strip(), "%H:%M").time()
+        except ValueError:
+            await interaction.response.send_message(
+                "Start and end times must follow HH:MM (24h) format.", ephemeral=True
+            )
+            return
+
+        now_local = datetime.now(tz=manager.timezone)
+        tolerance = timedelta(minutes=1)
+        scheduled_start_local = datetime.combine(
+            now_local.date(), start_hhmm, tzinfo=manager.timezone
+        )
+        if scheduled_start_local + tolerance < now_local:
+            scheduled_start_local += timedelta(days=1)
+        immediate = (scheduled_start_local - now_local) <= tolerance
+        effective_start_local = now_local if immediate else scheduled_start_local
+
+        scheduled_end_local = datetime.combine(
+            scheduled_start_local.date(), end_hhmm, tzinfo=manager.timezone
+        )
+        if scheduled_end_local <= scheduled_start_local:
+            scheduled_end_local += timedelta(days=1)
+        if immediate and scheduled_end_local <= effective_start_local:
+            scheduled_end_local += timedelta(days=1)
+
         await interaction.response.defer(ephemeral=True)
 
-        end_time = datetime.now(tz=UTC) + timedelta(
-            minutes=manager.config.manual_defaults.duration_minutes
-        )
-
-        giveaway = await manager.start_giveaway(
-            guild=interaction.guild,  # type: ignore[arg-type]
-            channel=target_channel,
-            winners=winners,
-            title=title,
-            description=description,
-            end_time=end_time,
-        )
-
-        await interaction.followup.send(
-            f"Giveaway `{giveaway.id}` created in {target_channel.mention} and ending at "
-            f"{giveaway.end_time.astimezone(manager.timezone):%Y-%m-%d %H:%M %Z}.",
-            ephemeral=True,
-        )
+        if immediate:
+            giveaway = await manager.start_giveaway(
+                guild=interaction.guild,  # type: ignore[arg-type]
+                channel=target_channel,
+                winners=winners,
+                title=title,
+                description=description,
+                end_time=scheduled_end_local.astimezone(UTC),
+            )
+            await interaction.followup.send(
+                f"Giveaway `{giveaway.id}` started immediately in {target_channel.mention} "
+                f"and will end at {giveaway.end_time.astimezone(manager.timezone):%Y-%m-%d %H:%M %Z}.",
+                ephemeral=True,
+            )
+        else:
+            pending = await manager.schedule_manual_giveaway(
+                interaction.guild,  # type: ignore[arg-type]
+                target_channel,
+                winners=winners,
+                title=title,
+                description=description,
+                start_time=scheduled_start_local,
+                end_time=scheduled_end_local,
+            )
+            await interaction.followup.send(
+                f"Giveaway **{title}** scheduled for {scheduled_start_local:%Y-%m-%d %H:%M %Z} "
+                f"in {target_channel.mention} and set to end at "
+                f"{scheduled_end_local:%Y-%m-%d %H:%M %Z}. (Schedule ID: {pending.id})",
+                ephemeral=True,
+            )
 
     @bot.tree.command(name="giveaway-end", description="End a giveaway immediately.")
     @app_commands.describe(giveaway_id="Identifier of the giveaway to end.")
@@ -554,6 +601,132 @@ def register_commands(bot: GiveawayBot) -> None:
         await interaction.followup.send(
             f"Logger channel set to {target_channel.mention}.", ephemeral=True
         )
+
+    @bot.tree.command(
+        name="giveaway-cleanup",
+        description="Remove finished giveaways from the bot history.",
+    )
+    async def giveaway_cleanup(interaction: discord.Interaction) -> None:
+        error = await admin_required(interaction, manager)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        removed = await manager.cleanup_finished()
+        if removed == 0:
+            await interaction.followup.send(
+                "No finished giveaways found to remove.", ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                f"Removed {removed} finished giveaway(s) from history.", ephemeral=True
+            )
+
+    @bot.tree.command(
+        name="giveaway-show", description="Display details about a giveaway."
+    )
+    @app_commands.describe(giveaway_id="Identifier of the giveaway to display.")
+    async def giveaway_show(
+        interaction: discord.Interaction, giveaway_id: str
+    ) -> None:
+        error = await admin_required(interaction, manager)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a guild.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        giveaway = await manager.get_giveaway(giveaway_id)
+        if giveaway:
+            status_text = "Active" if giveaway.is_active else "Finished"
+            color = discord.Color.blue() if giveaway.is_active else discord.Color.dark_gray()
+            description_text = giveaway.description or "No description provided."
+            embed = discord.Embed(
+                title=giveaway.title,
+                description=description_text,
+                color=color,
+            )
+            embed.add_field(name="Status", value=status_text, inline=True)
+            embed.add_field(name="Channel", value=f"<#{giveaway.channel_id}>", inline=True)
+            embed.add_field(name="Planned Winners", value=str(giveaway.winners), inline=True)
+            embed.add_field(
+                name="Participant Count", value=str(len(giveaway.participants)), inline=True
+            )
+
+            created_local = giveaway.created_at.astimezone(manager.timezone)
+            embed.add_field(
+                name="Created At",
+                value=created_local.strftime("%Y-%m-%d %H:%M %Z"),
+                inline=False,
+            )
+            end_local = giveaway.end_time.astimezone(manager.timezone)
+            embed.add_field(
+                name="Ends At", value=end_local.strftime("%Y-%m-%d %H:%M %Z"), inline=False
+            )
+
+            if giveaway.scheduled_id:
+                embed.add_field(
+                    name="Scheduled Source", value=giveaway.scheduled_id, inline=False
+                )
+
+            if not giveaway.is_active:
+                if giveaway.last_announced_winners:
+                    winners_text = " ".join(
+                        f"<@{winner_id}>" for winner_id in giveaway.last_announced_winners
+                    )
+                else:
+                    winners_text = "No winners were selected."
+                embed.add_field(name="Winner(s)", value=winners_text, inline=False)
+
+            max_preview = 20
+            if giveaway.participants:
+                preview_lines = [
+                    f"- <@{user_id}>" for user_id in giveaway.participants[:max_preview]
+                ]
+                remaining = len(giveaway.participants) - max_preview
+                if remaining > 0:
+                    preview_lines.append(f"... and {remaining} more.")
+                participants_value = "\n".join(preview_lines)
+            else:
+                participants_value = "No participants yet."
+
+            embed.add_field(
+                name="Participants",
+                value=participants_value,
+                inline=False,
+            )
+
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        pending = await manager.get_pending_giveaway(giveaway_id)
+        if pending:
+            embed = discord.Embed(
+                title=pending.title,
+                description=pending.description or "No description provided.",
+                color=discord.Color.orange(),
+            )
+            embed.add_field(name="Status", value="Scheduled", inline=True)
+            embed.add_field(name="Channel", value=f"<#{pending.channel_id}>", inline=True)
+            embed.add_field(name="Planned Winners", value=str(pending.winners), inline=True)
+
+            start_local = pending.start_time.astimezone(manager.timezone)
+            end_local = pending.end_time.astimezone(manager.timezone)
+            embed.add_field(
+                name="Starts At", value=start_local.strftime("%Y-%m-%d %H:%M %Z"), inline=False
+            )
+            embed.add_field(
+                name="Ends At", value=end_local.strftime("%Y-%m-%d %H:%M %Z"), inline=False
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        await interaction.followup.send("Giveaway not found.", ephemeral=True)
 
     @bot.tree.command(
         name="giveaway-add-admin-role",

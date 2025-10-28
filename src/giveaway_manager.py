@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 import discord
 
 from .config import Config, ScheduledGiveawayConfig
-from .models import BotState, Giveaway
+from .models import BotState, Giveaway, PendingGiveaway
 from .storage import StateStorage
 from .views import GiveawayView
 
@@ -29,6 +29,7 @@ class GiveawayManager:
         self.timezone = ZoneInfo(config.default_timezone)
         self.state = BotState(auto_enabled=config.scheduling.auto_enabled)
         self._finish_tasks: Dict[str, asyncio.Task] = {}
+        self._start_tasks: Dict[str, asyncio.Task] = {}
         self._state_lock = asyncio.Lock()
 
     async def load(self) -> None:
@@ -55,7 +56,14 @@ class GiveawayManager:
             self.state.admin_roles = unique_roles
             await self.save_state()
 
+        await self._restore_pending_giveaways()
         await self._restore_active_giveaways()
+
+    async def _restore_pending_giveaways(self) -> None:
+        async with self._state_lock:
+            pending_items = list(self.state.list_pending())
+        for pending in pending_items:
+            await self._schedule_start(pending, reschedule=False)
 
     async def _restore_active_giveaways(self) -> None:
         for giveaway in self.state.list_all():
@@ -153,6 +161,43 @@ class GiveawayManager:
             sorted(effective_role_ids),
         )
         return False
+
+    async def schedule_manual_giveaway(
+        self,
+        guild: discord.Guild,
+        channel: discord.TextChannel,
+        *,
+        winners: int,
+        title: str,
+        description: str,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> PendingGiveaway:
+        if winners <= 0:
+            raise ValueError("winners must be greater than zero")
+        if end_time <= start_time:
+            raise ValueError("end_time must be after start_time")
+
+        pending = PendingGiveaway(
+            id=self._generate_giveaway_id(),
+            guild_id=guild.id,
+            channel_id=channel.id,
+            winners=winners,
+            title=title,
+            description=description,
+            start_time=start_time.astimezone(UTC),
+            end_time=end_time.astimezone(UTC),
+        )
+        async with self._state_lock:
+            self.state.upsert_pending(pending)
+            await self.save_state()
+
+        await self._schedule_start(pending)
+        await self._notify_logger(
+            f"Giveaway **{pending.title}** scheduled for <#{pending.channel_id}> at "
+            f"{pending.start_time.astimezone(self.timezone):%Y-%m-%d %H:%M %Z}."
+        )
+        return pending
 
     async def start_giveaway(
         self,
@@ -294,6 +339,34 @@ class GiveawayManager:
     async def list_giveaways(self) -> Iterable[Giveaway]:
         async with self._state_lock:
             return list(self.state.list_all())
+
+    async def get_pending_giveaway(self, pending_id: str) -> Optional[PendingGiveaway]:
+        async with self._state_lock:
+            return self.state.get_pending(pending_id)
+
+    async def cleanup_finished(self) -> int:
+        async with self._state_lock:
+            remaining: list[Giveaway] = []
+            removed: list[Giveaway] = []
+            for giveaway in self.state.giveaways:
+                if giveaway.is_active:
+                    remaining.append(giveaway)
+                else:
+                    removed.append(giveaway)
+            if not removed:
+                return 0
+            self.state.giveaways = remaining
+            await self.save_state()
+
+        for giveaway in removed:
+            finish_task = self._finish_tasks.pop(giveaway.id, None)
+            if finish_task:
+                finish_task.cancel()
+
+        await self._notify_logger(
+            f"Cleaned up {len(removed)} finished giveaway(s) from history."
+        )
+        return len(removed)
 
     async def get_text_channel(self, channel_id: int) -> Optional[discord.TextChannel]:
         return await self._fetch_text_channel(channel_id)
@@ -494,6 +567,80 @@ class GiveawayManager:
     async def _register_view(self, giveaway: Giveaway) -> None:
         view = self._build_view(giveaway.id)
         self.bot.add_view(view, message_id=giveaway.message_id)
+
+    async def _schedule_start(
+        self, pending: PendingGiveaway, *, reschedule: bool = True
+    ) -> None:
+        if reschedule and pending.id in self._start_tasks:
+            self._start_tasks[pending.id].cancel()
+
+        async def runner() -> None:
+            try:
+                now = datetime.now(tz=UTC)
+                delay = (pending.start_time - now).total_seconds()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                await self._start_pending_giveaway(pending.id)
+            except asyncio.CancelledError:
+                log.debug("Start task for pending giveaway %s cancelled", pending.id)
+                raise
+            finally:
+                self._start_tasks.pop(pending.id, None)
+
+        task = asyncio.create_task(runner())
+        self._start_tasks[pending.id] = task
+
+    async def _start_pending_giveaway(self, pending_id: str) -> None:
+        async with self._state_lock:
+            pending = self.state.get_pending(pending_id)
+        if not pending:
+            return
+
+        channel = await self._fetch_text_channel(pending.channel_id)
+        if not channel or not isinstance(channel, discord.TextChannel):
+            log.warning(
+                "Pending giveaway %s channel %s unavailable; removing from state.",
+                pending_id,
+                pending.channel_id,
+            )
+            async with self._state_lock:
+                removed = self.state.remove_pending(pending_id)
+                if removed:
+                    await self.save_state()
+            await self._notify_logger(
+                f"Scheduled giveaway `{pending_id}` could not start because channel <#{pending.channel_id}> is unavailable."
+            )
+            return
+
+        guild = channel.guild
+        try:
+            giveaway = await self.start_giveaway(
+                guild,
+                channel,
+                winners=pending.winners,
+                title=pending.title,
+                description=pending.description,
+                end_time=pending.end_time,
+            )
+        except Exception:
+            log.exception("Failed to start pending giveaway %s", pending_id)
+            async with self._state_lock:
+                removed = self.state.remove_pending(pending_id)
+                if removed:
+                    await self.save_state()
+            await self._notify_logger(
+                f"Scheduled giveaway `{pending_id}` failed to start. Check logs for details."
+            )
+            return
+
+        async with self._state_lock:
+            removed = self.state.remove_pending(pending_id)
+            if removed:
+                await self.save_state()
+
+        await self._notify_logger(
+            f"Scheduled giveaway `{pending_id}` started as `{giveaway.id}`."
+        )
 
     async def _schedule_finish(
         self, giveaway: Giveaway, *, reschedule: bool = False

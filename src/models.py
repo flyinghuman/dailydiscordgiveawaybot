@@ -72,12 +72,50 @@ class Giveaway:
 
 
 @dataclass(slots=True)
+class PendingGiveaway:
+    id: str
+    guild_id: int
+    channel_id: int
+    winners: int
+    title: str
+    description: str
+    start_time: datetime
+    end_time: datetime
+
+    def to_payload(self) -> dict:
+        return {
+            "id": self.id,
+            "guild_id": self.guild_id,
+            "channel_id": self.channel_id,
+            "winners": self.winners,
+            "title": self.title,
+            "description": self.description,
+            "start_time": self.start_time.isoformat(),
+            "end_time": self.end_time.isoformat(),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict) -> "PendingGiveaway":
+        return cls(
+            id=str(payload["id"]),
+            guild_id=int(payload["guild_id"]),
+            channel_id=int(payload["channel_id"]),
+            winners=int(payload["winners"]),
+            title=str(payload["title"]),
+            description=str(payload["description"]),
+            start_time=datetime.fromisoformat(payload["start_time"]),
+            end_time=datetime.fromisoformat(payload["end_time"]),
+        )
+
+
+@dataclass(slots=True)
 class BotState:
     auto_enabled: bool = True
     logger_channel_id: Optional[int] = None
     schedule_runs: dict = field(default_factory=dict)
     giveaways: List[Giveaway] = field(default_factory=list)
     admin_roles: List[int] = field(default_factory=list)
+    pending_giveaways: List[PendingGiveaway] = field(default_factory=list)
 
     def to_payload(self) -> dict:
         return {
@@ -86,18 +124,22 @@ class BotState:
             "schedule_runs": self.schedule_runs,
             "giveaways": [g.to_payload() for g in self.giveaways],
             "admin_roles": self.admin_roles,
+            "pending_giveaways": [p.to_payload() for p in self.pending_giveaways],
         }
 
     @classmethod
     def from_payload(cls, payload: dict) -> "BotState":
         giveaways_payload = payload.get("giveaways", [])
         giveaways = [Giveaway.from_payload(g) for g in giveaways_payload]
+        pending_payload = payload.get("pending_giveaways", [])
+        pending = [PendingGiveaway.from_payload(p) for p in pending_payload]
         state = cls(
             auto_enabled=bool(payload.get("auto_enabled", True)),
             logger_channel_id=payload.get("logger_channel_id"),
             schedule_runs=dict(payload.get("schedule_runs", {})),
             giveaways=giveaways,
             admin_roles=[int(r) for r in payload.get("admin_roles", [])],
+            pending_giveaways=pending,
         )
         return state
 
@@ -125,3 +167,25 @@ class BotState:
 
     def list_all(self) -> Sequence[Giveaway]:
         return tuple(self.giveaways)
+
+    def get_pending(self, pending_id: str) -> Optional[PendingGiveaway]:
+        for item in self.pending_giveaways:
+            if item.id == pending_id:
+                return item
+        return None
+
+    def upsert_pending(self, pending: PendingGiveaway) -> None:
+        for idx, item in enumerate(self.pending_giveaways):
+            if item.id == pending.id:
+                self.pending_giveaways[idx] = pending
+                return
+        self.pending_giveaways.append(pending)
+
+    def remove_pending(self, pending_id: str) -> Optional[PendingGiveaway]:
+        for idx, item in enumerate(self.pending_giveaways):
+            if item.id == pending_id:
+                return self.pending_giveaways.pop(idx)
+        return None
+
+    def list_pending(self) -> Sequence[PendingGiveaway]:
+        return tuple(self.pending_giveaways)

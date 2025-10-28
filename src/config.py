@@ -53,6 +53,7 @@ class SchedulingConfig:
 @dataclass(slots=True)
 class PermissionsConfig:
     admin_roles: List[int]
+    development_guild_id: Optional[int] = None
 
 
 @dataclass(slots=True)
@@ -169,7 +170,24 @@ def _parse_permissions(data: Dict[str, Any]) -> PermissionsConfig:
             raise ConfigError(
                 f"permissions.admin_roles contains invalid role id: {role_id!r}"
             ) from exc
-    return PermissionsConfig(admin_roles=admin_roles)
+    dev_guild_raw = data.get("development_guild_id")
+    development_guild_id: Optional[int]
+    if dev_guild_raw in (None, "", 0):
+        development_guild_id = None
+    else:
+        try:
+            development_guild_id = int(dev_guild_raw)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                "permissions.development_guild_id must be an integer guild ID or null."
+            ) from exc
+        if development_guild_id <= 0:
+            raise ConfigError(
+                "permissions.development_guild_id must be a positive integer."
+            )
+    return PermissionsConfig(
+        admin_roles=admin_roles, development_guild_id=development_guild_id
+    )
 
 
 def load_config(path: Path) -> Config:

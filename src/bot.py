@@ -4,7 +4,6 @@ import argparse
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
-import re
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfoNotFoundError
@@ -18,34 +17,7 @@ from .giveaway_manager import GiveawayManager
 from .storage import StateStorage
 
 
-CHANNEL_MENTION_RE = re.compile(r"^<#?(\d+)>?$")
-
-
 PERMISSION_LOG = logging.getLogger("giveaway.permissions")
-
-def _resolve_text_channel(guild: discord.Guild, value: str) -> Optional[discord.TextChannel]:
-    if not value:
-        return None
-
-    value = value.strip()
-    match = CHANNEL_MENTION_RE.match(value)
-    channel: Optional[discord.abc.GuildChannel] = None
-    if match:
-        channel_id = int(match.group(1))
-        channel = guild.get_channel(channel_id)
-        if isinstance(channel, discord.TextChannel):
-            return channel
-    if value.isdigit():
-        channel_id = int(value)
-        channel = guild.get_channel(channel_id)
-        if isinstance(channel, discord.TextChannel):
-            return channel
-
-    lookup = value.lstrip("#").lower()
-    for text_channel in guild.text_channels:
-        if text_channel.name.lower() == lookup:
-            return text_channel
-    return None
 
 def configure_logging(level: str) -> None:
     console_level = getattr(logging, level.upper(), logging.INFO)
@@ -206,7 +178,7 @@ def register_commands(bot: GiveawayBot) -> None:
     )
     async def giveaway_start(
         interaction: discord.Interaction,
-        channel: str,
+        channel: discord.TextChannel,
         winners: app_commands.Range[int, 1, 100],
         title: str,
         description: str,
@@ -222,14 +194,6 @@ def register_commands(bot: GiveawayBot) -> None:
             )
             return
 
-        target_channel = _resolve_text_channel(interaction.guild, channel)
-        if not target_channel:
-            await interaction.response.send_message(
-                "Could not resolve the provided channel. Use a mention, ID, or exact name.",
-                ephemeral=True,
-            )
-            return
-
         await interaction.response.defer(ephemeral=True)
 
         end_time = datetime.now(tz=UTC) + timedelta(
@@ -238,7 +202,7 @@ def register_commands(bot: GiveawayBot) -> None:
 
         giveaway = await manager.start_giveaway(
             guild=interaction.guild,  # type: ignore[arg-type]
-            channel=target_channel,
+            channel=channel,
             winners=winners,
             title=title,
             description=description,
@@ -246,7 +210,7 @@ def register_commands(bot: GiveawayBot) -> None:
         )
 
         await interaction.followup.send(
-            f"Giveaway `{giveaway.id}` created in {target_channel.mention} and ending at "
+            f"Giveaway `{giveaway.id}` created in {channel.mention} and ending at "
             f"{giveaway.end_time.astimezone(manager.timezone):%Y-%m-%d %H:%M %Z}.",
             ephemeral=True,
         )
@@ -424,7 +388,7 @@ def register_commands(bot: GiveawayBot) -> None:
         channel="Channel where log messages should be posted (mention, ID, or name)."
     )
     async def giveaway_logger(
-        interaction: discord.Interaction, channel: str
+        interaction: discord.Interaction, channel: discord.TextChannel
     ) -> None:
         error = await admin_required(interaction, manager)
         if error:
@@ -436,18 +400,10 @@ def register_commands(bot: GiveawayBot) -> None:
             )
             return
 
-        target_channel = _resolve_text_channel(interaction.guild, channel)
-        if not target_channel:
-            await interaction.response.send_message(
-                "Could not resolve the provided channel. Use a mention, ID, or exact name.",
-                ephemeral=True,
-            )
-            return
-
         await interaction.response.defer(ephemeral=True)
-        await manager.set_logger_channel(target_channel.id)
+        await manager.set_logger_channel(channel.id)
         await interaction.followup.send(
-            f"Logger channel set to {target_channel.mention}.", ephemeral=True
+            f"Logger channel set to {channel.mention}.", ephemeral=True
         )
 
     @bot.tree.command(

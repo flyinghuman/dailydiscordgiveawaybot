@@ -3,14 +3,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, time
 from typing import Dict, Iterable, Optional
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
 
 from .config import Config, ScheduledGiveawayConfig
-from .models import BotState, Giveaway, PendingGiveaway
+from .models import BotState, Giveaway, GuildState, PendingGiveaway, RecurringGiveaway
 from .storage import StateStorage
 from .views import GiveawayView
 
@@ -26,10 +26,11 @@ class GiveawayManager:
         self.bot = bot
         self.config = config
         self.storage = storage
-        self.timezone = ZoneInfo(config.default_timezone)
-        self.state = BotState(auto_enabled=config.scheduling.auto_enabled)
+        self._default_timezone = config.default_timezone
+        self.state = BotState()
         self._finish_tasks: Dict[str, asyncio.Task] = {}
-        self._start_tasks: Dict[str, asyncio.Task] = {}
+        self._pending_tasks: Dict[str, asyncio.Task] = {}
+        self._recurring_tasks: Dict[str, asyncio.Task] = {}
         self._state_lock = asyncio.Lock()
 
     async def load(self) -> None:
@@ -39,40 +40,89 @@ class GiveawayManager:
             log.exception(
                 "Failed to load persisted state, starting with defaults: %s", exc
             )
-            self.state = BotState(auto_enabled=self.config.scheduling.auto_enabled)
+            self.state = BotState()
 
-        # If config changed to disable auto scheduling ensure state reflects it
-        self.state.auto_enabled = (
-            self.config.scheduling.auto_enabled and self.state.auto_enabled
-        )
+        default_admin_roles = list(self.config.permissions.admin_roles or [])
+        updated = False
+        for _, guild_state in self.state.iter_guild_states():
+            auto_enabled = (
+                self.config.scheduling.auto_enabled and guild_state.auto_enabled
+            )
+            if guild_state.auto_enabled != auto_enabled:
+                guild_state.auto_enabled = auto_enabled
+                updated = True
+            if not guild_state.admin_roles and default_admin_roles:
+                guild_state.admin_roles = list(default_admin_roles)
+                updated = True
+            tz_name = guild_state.timezone or self._default_timezone
+            try:
+                ZoneInfo(tz_name)
+            except ZoneInfoNotFoundError:
+                tz_name = self._default_timezone
+                updated = True
+            if guild_state.timezone != tz_name:
+                guild_state.timezone = tz_name
+                updated = True
 
-        # Seed admin roles from config if none persisted yet
-        if not self.state.admin_roles and self.config.permissions.admin_roles:
-            unique_roles = []
-            for role_id in self.config.permissions.admin_roles:
-                role_id_int = int(role_id)
-                if role_id_int not in unique_roles:
-                    unique_roles.append(role_id_int)
-            self.state.admin_roles = unique_roles
+        if updated:
             await self.save_state()
 
         await self._restore_pending_giveaways()
         await self._restore_active_giveaways()
+        await self._restore_recurring_giveaways()
 
     async def _restore_pending_giveaways(self) -> None:
         async with self._state_lock:
-            pending_items = list(self.state.list_pending())
+            pending_items = [
+                pending
+                for _, guild_state in self.state.iter_guild_states()
+                for pending in guild_state.pending_giveaways
+            ]
         for pending in pending_items:
             await self._schedule_start(pending, reschedule=False)
 
     async def _restore_active_giveaways(self) -> None:
-        for giveaway in self.state.list_all():
-            if giveaway.is_active:
-                await self._register_view(giveaway)
-                await self._schedule_finish(giveaway)
+        async with self._state_lock:
+            active_items = [
+                giveaway
+                for _, guild_state in self.state.iter_guild_states()
+                for giveaway in guild_state.giveaways
+                if giveaway.is_active
+            ]
+        for giveaway in active_items:
+            await self._register_view(giveaway)
+            await self._schedule_finish(giveaway)
+
+    async def _restore_recurring_giveaways(self) -> None:
+        async with self._state_lock:
+            recurring_items = [
+                recurring
+                for _, guild_state in self.state.iter_guild_states()
+                for recurring in guild_state.recurring_giveaways
+                if recurring.enabled
+            ]
+        for recurring in recurring_items:
+            await self._schedule_recurring(recurring, reschedule=False)
 
     async def save_state(self) -> None:
         await self.storage.save(self.state)
+
+    def _ensure_guild_state(self, guild_id: int) -> GuildState:
+        state = self.state.ensure_guild_state(
+            guild_id, default_admin_roles=self.config.permissions.admin_roles
+        )
+        if not state.timezone:
+            state.timezone = self._default_timezone
+        return state
+
+    def get_timezone(self, guild_id: int) -> ZoneInfo:
+        state = self._ensure_guild_state(guild_id)
+        tz_name = state.timezone or self._default_timezone or "Europe/Berlin"
+        try:
+            return ZoneInfo(tz_name)
+        except ZoneInfoNotFoundError:
+            state.timezone = "Europe/Berlin"
+            return ZoneInfo("Europe/Berlin")
 
     def is_admin(
         self,
@@ -138,9 +188,14 @@ class GiveawayManager:
                         except (TypeError, ValueError):
                             continue
 
-        admin_roles = set(self.state.admin_roles)
+        guild_context = getattr(member, "guild", None)
+        admin_roles: set[int] = set()
+        if guild_context is not None:
+            guild_state = self.state.get_guild_state(guild_context.id)
+            if guild_state and guild_state.admin_roles:
+                admin_roles.update(int(r) for r in guild_state.admin_roles)
         if not admin_roles and self.config.permissions.admin_roles:
-            admin_roles = set(int(r) for r in self.config.permissions.admin_roles)
+            admin_roles.update(int(r) for r in self.config.permissions.admin_roles)
         if not admin_roles:
             log.debug("No giveaway admin roles configured; denying member %s.", member.id)
             return False
@@ -178,6 +233,8 @@ class GiveawayManager:
         if end_time <= start_time:
             raise ValueError("end_time must be after start_time")
 
+        self._ensure_guild_state(guild.id)
+
         pending = PendingGiveaway(
             id=self._generate_giveaway_id(),
             guild_id=guild.id,
@@ -189,15 +246,74 @@ class GiveawayManager:
             end_time=end_time.astimezone(UTC),
         )
         async with self._state_lock:
-            self.state.upsert_pending(pending)
+            self._ensure_guild_state(pending.guild_id)
+            self.state.upsert_pending(pending.guild_id, pending)
             await self.save_state()
 
         await self._schedule_start(pending)
         await self._notify_logger(
             f"Giveaway **{pending.title}** scheduled for <#{pending.channel_id}> at "
-            f"{pending.start_time.astimezone(self.timezone):%Y-%m-%d %H:%M %Z}."
+            f"{pending.start_time.astimezone(self.get_timezone(pending.guild_id)):%Y-%m-%d %H:%M %Z}.",
+            guild_id=pending.guild_id,
         )
         return pending
+
+    async def schedule_recurring_giveaway(
+        self,
+        guild: discord.Guild,
+        channel: discord.TextChannel,
+        *,
+        winners: int,
+        title: str,
+        description: str,
+        start_local: datetime,
+        end_local: datetime,
+        immediate_started: bool,
+    ) -> "RecurringGiveaway":
+        schedule_id = f"R{self._generate_giveaway_id()}"
+        self._ensure_guild_state(guild.id)
+        tz = self.get_timezone(guild.id)
+        base_start_time = start_local.astimezone(tz).time()
+        base_end_time = end_local.astimezone(tz).time()
+
+        if immediate_started:
+            next_start_local, next_end_local = self._compute_next_window(
+                guild.id, base_start_time, base_end_time, reference=start_local
+            )
+        else:
+            if start_local <= datetime.now(tz=tz):
+                next_start_local, next_end_local = self._compute_next_window(
+                    guild.id, base_start_time, base_end_time, reference=None
+                )
+            else:
+                next_start_local = start_local.astimezone(UTC)
+                next_end_local = end_local.astimezone(UTC)
+
+        recurring = RecurringGiveaway(
+            id=schedule_id,
+            guild_id=guild.id,
+            channel_id=channel.id,
+            winners=winners,
+            title=title,
+            description=description,
+            start_time=base_start_time,
+            end_time=base_end_time,
+            next_start=next_start_local,
+            next_end=next_end_local,
+            enabled=True,
+        )
+
+        async with self._state_lock:
+            self._ensure_guild_state(guild.id)
+            self.state.upsert_recurring(guild.id, recurring)
+            await self.save_state()
+
+        await self._schedule_recurring(recurring)
+        await self._notify_logger(
+            f"Recurring giveaway `{recurring.id}` configured for <#{recurring.channel_id}>.",
+            guild_id=guild.id,
+        )
+        return recurring
 
     async def start_giveaway(
         self,
@@ -215,6 +331,7 @@ class GiveawayManager:
 
         giveaway_id = self._generate_giveaway_id()
         view = self._build_view(giveaway_id)
+        tz = self.get_timezone(guild.id)
         embed = self._build_embed(
             giveaway=None,
             title=title,
@@ -223,6 +340,7 @@ class GiveawayManager:
             participants=0,
             end_time=end_time,
             status="Active",
+            tz=tz,
         )
         message = await channel.send(embed=embed, view=view)
         self.bot.add_view(view, message_id=message.id)
@@ -241,6 +359,7 @@ class GiveawayManager:
         )
 
         async with self._state_lock:
+            self._ensure_guild_state(giveaway.guild_id)
             self.state.upsert_giveaway(giveaway)
             await self.save_state()
 
@@ -249,15 +368,16 @@ class GiveawayManager:
         await message.edit(embed=self._embed_from_giveaway(giveaway), view=view)
 
         await self._notify_logger(
-            f"Giveaway **{giveaway.title}** (`{giveaway.id}`) started in <#{giveaway.channel_id}>."
+            f"Giveaway **{giveaway.title}** (`{giveaway.id}`) started in <#{giveaway.channel_id}>.",
+            guild_id=giveaway.guild_id,
         )
         return giveaway
 
     async def end_giveaway(
-        self, giveaway_id: str, *, notify: bool = True
+        self, guild_id: int, giveaway_id: str, *, notify: bool = True
     ) -> Optional[Giveaway]:
         async with self._state_lock:
-            giveaway = self.state.get_giveaway(giveaway_id)
+            giveaway = self.state.get_giveaway(guild_id, giveaway_id)
             if not giveaway:
                 return None
             if not giveaway.is_active:
@@ -301,12 +421,15 @@ class GiveawayManager:
 
         await self.save_state()
         await self._notify_logger(
-            f"Giveaway **{giveaway.title}** (`{giveaway.id}`) finished with {len(winners)} winner(s)."
+            f"Giveaway **{giveaway.title}** (`{giveaway.id}`) finished with {len(winners)} winner(s).",
+            guild_id=giveaway.guild_id,
         )
 
-    async def add_participant(self, giveaway_id: str, user: discord.Member) -> str:
+    async def add_participant(
+        self, guild_id: int, giveaway_id: str, user: discord.Member
+    ) -> str:
         async with self._state_lock:
-            giveaway = self.state.get_giveaway(giveaway_id)
+            giveaway = self.state.get_giveaway(guild_id, giveaway_id)
             if not giveaway:
                 return "This giveaway is no longer available."
             if not giveaway.is_active:
@@ -317,12 +440,16 @@ class GiveawayManager:
             await self.save_state()
 
         await self._update_embed(giveaway)
-        await self._notify_logger(f"{user.mention} joined giveaway `{giveaway.id}`.")
+        await self._notify_logger(
+            f"{user.mention} joined giveaway `{giveaway.id}`.", guild_id=guild_id
+        )
         return "You're in! Good luck!"
 
-    async def remove_participant(self, giveaway_id: str, user: discord.Member) -> str:
+    async def remove_participant(
+        self, guild_id: int, giveaway_id: str, user: discord.Member
+    ) -> str:
         async with self._state_lock:
-            giveaway = self.state.get_giveaway(giveaway_id)
+            giveaway = self.state.get_giveaway(guild_id, giveaway_id)
             if not giveaway:
                 return "This giveaway is no longer available."
             if not giveaway.is_active:
@@ -333,29 +460,34 @@ class GiveawayManager:
             await self.save_state()
 
         await self._update_embed(giveaway)
-        await self._notify_logger(f"{user.mention} left giveaway `{giveaway.id}`.")
+        await self._notify_logger(
+            f"{user.mention} left giveaway `{giveaway.id}`.", guild_id=guild_id
+        )
         return "You've left the giveaway."
 
-    async def list_giveaways(self) -> Iterable[Giveaway]:
+    async def list_giveaways(self, guild_id: int) -> Iterable[Giveaway]:
         async with self._state_lock:
-            return list(self.state.list_all())
+            return list(self.state.list_all(guild_id))
 
-    async def get_pending_giveaway(self, pending_id: str) -> Optional[PendingGiveaway]:
+    async def get_pending_giveaway(
+        self, guild_id: int, pending_id: str
+    ) -> Optional[PendingGiveaway]:
         async with self._state_lock:
-            return self.state.get_pending(pending_id)
+            return self.state.get_pending(guild_id, pending_id)
 
-    async def cleanup_finished(self) -> int:
+    async def cleanup_finished(self, guild_id: int) -> int:
         async with self._state_lock:
+            guild_state = self._ensure_guild_state(guild_id)
             remaining: list[Giveaway] = []
             removed: list[Giveaway] = []
-            for giveaway in self.state.giveaways:
+            for giveaway in guild_state.giveaways:
                 if giveaway.is_active:
                     remaining.append(giveaway)
                 else:
                     removed.append(giveaway)
             if not removed:
                 return 0
-            self.state.giveaways = remaining
+            guild_state.giveaways = remaining
             await self.save_state()
 
         for giveaway in removed:
@@ -364,48 +496,64 @@ class GiveawayManager:
                 finish_task.cancel()
 
         await self._notify_logger(
-            f"Cleaned up {len(removed)} finished giveaway(s) from history."
+            f"Cleaned up {len(removed)} finished giveaway(s) from history.",
+            guild_id=guild_id,
         )
         return len(removed)
 
     async def get_text_channel(self, channel_id: int) -> Optional[discord.TextChannel]:
         return await self._fetch_text_channel(channel_id)
 
-    async def set_logger_channel(self, channel_id: Optional[int]) -> None:
+    async def set_logger_channel(
+        self, guild_id: int, channel_id: Optional[int]
+    ) -> None:
         async with self._state_lock:
-            self.state.logger_channel_id = channel_id
+            guild_state = self._ensure_guild_state(guild_id)
+            guild_state.logger_channel_id = channel_id
             await self.save_state()
 
-    async def toggle_auto(self, enabled: bool) -> bool:
+    async def toggle_auto(self, guild_id: int, enabled: bool) -> bool:
         async with self._state_lock:
-            self.state.auto_enabled = enabled
+            guild_state = self._ensure_guild_state(guild_id)
+            guild_state.auto_enabled = enabled
             await self.save_state()
-            return self.state.auto_enabled
+            return guild_state.auto_enabled
 
-    async def add_admin_role(self, role_id: int) -> bool:
+    async def add_admin_role(self, guild_id: int, role_id: int) -> bool:
         async with self._state_lock:
-            if role_id in self.state.admin_roles:
+            guild_state = self._ensure_guild_state(guild_id)
+            if role_id in guild_state.admin_roles:
                 return False
-            self.state.admin_roles.append(role_id)
+            guild_state.admin_roles.append(role_id)
             await self.save_state()
-        await self._notify_logger(f"Role <@&{role_id}> added to giveaway administrators.")
+        await self._notify_logger(
+            f"Role <@&{role_id}> added to giveaway administrators.", guild_id=guild_id
+        )
         return True
 
-    async def remove_admin_role(self, role_id: int) -> bool:
+    async def remove_admin_role(self, guild_id: int, role_id: int) -> bool:
         async with self._state_lock:
-            if role_id not in self.state.admin_roles:
+            guild_state = self._ensure_guild_state(guild_id)
+            if role_id not in guild_state.admin_roles:
                 return False
-            self.state.admin_roles.remove(role_id)
+            guild_state.admin_roles.remove(role_id)
             await self.save_state()
-        await self._notify_logger(f"Role <@&{role_id}> removed from giveaway administrators.")
+        await self._notify_logger(
+            f"Role <@&{role_id}> removed from giveaway administrators.",
+            guild_id=guild_id,
+        )
         return True
 
-    async def list_admin_roles(self) -> list[int]:
+    async def list_admin_roles(self, guild_id: int) -> list[int]:
         async with self._state_lock:
-            return list(self.state.admin_roles)
+            guild_state = self.state.get_guild_state(guild_id)
+            if not guild_state:
+                return []
+            return list(guild_state.admin_roles)
 
     async def update_giveaway(
         self,
+        guild_id: int,
         giveaway_id: str,
         *,
         winners: Optional[int] = None,
@@ -414,7 +562,7 @@ class GiveawayManager:
         end_time: Optional[datetime] = None,
     ) -> Optional[Giveaway]:
         async with self._state_lock:
-            giveaway = self.state.get_giveaway(giveaway_id)
+            giveaway = self.state.get_giveaway(guild_id, giveaway_id)
             if not giveaway:
                 return None
 
@@ -435,12 +583,16 @@ class GiveawayManager:
             await self._schedule_finish(giveaway, reschedule=True)
 
         await self._update_embed(giveaway)
-        await self._notify_logger(f"Giveaway `{giveaway.id}` updated.")
+        await self._notify_logger(
+            f"Giveaway `{giveaway.id}` updated.", guild_id=guild_id
+        )
         return giveaway
 
-    async def reroll(self, giveaway_id: str) -> Optional[Iterable[int]]:
+    async def reroll(
+        self, guild_id: int, giveaway_id: str
+    ) -> Optional[Iterable[int]]:
         async with self._state_lock:
-            giveaway = self.state.get_giveaway(giveaway_id)
+            giveaway = self.state.get_giveaway(guild_id, giveaway_id)
             if not giveaway:
                 return None
             if giveaway.is_active:
@@ -449,35 +601,71 @@ class GiveawayManager:
             giveaway.last_announced_winners = list(winners)
             await self.save_state()
 
-        await self._notify_logger(f"Giveaway `{giveaway.id}` rerolled.")
+        await self._notify_logger(
+            f"Giveaway `{giveaway.id}` rerolled.", guild_id=guild_id
+        )
         return winners
 
-    async def get_giveaway(self, giveaway_id: str) -> Optional[Giveaway]:
+    async def get_giveaway(
+        self, guild_id: int, giveaway_id: str
+    ) -> Optional[Giveaway]:
         async with self._state_lock:
-            return self.state.get_giveaway(giveaway_id)
+            return self.state.get_giveaway(guild_id, giveaway_id)
 
     async def handle_scheduled(self) -> None:
-        if not self.state.auto_enabled or not self.config.scheduling.auto_enabled:
+        if not self.config.scheduling.auto_enabled:
             return
 
         now_utc = datetime.now(tz=UTC)
-        now_local = now_utc.astimezone(self.timezone)
-        today = now_local.date()
-        today_iso = today.isoformat()
-
-        async with self._state_lock:
-            schedule_runs = dict(self.state.schedule_runs)
 
         for schedule in self.config.scheduling.giveaways:
             if not schedule.enabled:
                 continue
+            channel_id = schedule.channel_id
+            if not channel_id:
+                log.debug(
+                    "Scheduled giveaway %s skipped because no channel is configured.",
+                    schedule.id,
+                )
+                continue
+            channel = await self._fetch_text_channel(channel_id)
+            guild = channel.guild if channel else None
+            if not channel or not guild:
+                log.info(
+                    "Scheduled giveaway %s channel %s not found; skipping run.",
+                    schedule.id,
+                    schedule.channel_id,
+                )
+                continue
+
+            tz = self.get_timezone(guild.id)
+            now_local = now_utc.astimezone(tz)
+            today_iso = now_local.date().isoformat()
+
+            async with self._state_lock:
+                guild_state = self._ensure_guild_state(guild.id)
+                guild_auto_enabled = guild_state.auto_enabled
+                schedule_runs_snapshot = dict(guild_state.schedule_runs)
+
+            if not guild_auto_enabled:
+                continue
+
             await self._maybe_start_schedule(
-                schedule, now_local, today_iso, schedule_runs
+                schedule,
+                guild,
+                channel,
+                tz,
+                now_local,
+                today_iso,
+                schedule_runs_snapshot,
             )
 
     async def _maybe_start_schedule(
         self,
         schedule: ScheduledGiveawayConfig,
+        guild: discord.Guild,
+        channel: discord.TextChannel,
+        tz: ZoneInfo,
         now_local: datetime,
         today_iso: str,
         schedule_runs_snapshot: dict,
@@ -486,42 +674,21 @@ class GiveawayManager:
         if last_run == today_iso:
             return
 
-        start_dt = datetime.combine(
-            now_local.date(), schedule.start_time, tzinfo=self.timezone
-        )
-        end_dt = datetime.combine(
-            now_local.date(), schedule.end_time, tzinfo=self.timezone
-        )
+        start_dt = datetime.combine(now_local.date(), schedule.start_time, tzinfo=tz)
+        end_dt = datetime.combine(now_local.date(), schedule.end_time, tzinfo=tz)
         if end_dt <= start_dt:
             end_dt += timedelta(days=1)
         if now_local < start_dt:
             return
 
         async with self._state_lock:
-            # Check if there is an active giveaway already tied to this schedule
             active_existing = [
-                g for g in self.state.list_active() if g.scheduled_id == schedule.id
+                g
+                for g in self.state.list_active(guild.id)
+                if g.scheduled_id == schedule.id and g.is_active
             ]
             if active_existing:
                 return
-
-        channel_id = schedule.channel_id
-        if not channel_id:
-            log.debug(
-                "Scheduled giveaway %s skipped because no channel is configured.",
-                schedule.id,
-            )
-            return
-
-        channel = await self._fetch_text_channel(channel_id)
-        guild = channel.guild if channel else None
-        if not channel or not guild:
-            log.info(
-                "Scheduled giveaway %s channel %s not found; skipping run.",
-                schedule.id,
-                channel_id,
-            )
-            return
 
         giveaway = await self.start_giveaway(
             guild,
@@ -534,11 +701,13 @@ class GiveawayManager:
         )
 
         async with self._state_lock:
-            self.state.schedule_runs[schedule.id] = today_iso
+            guild_state = self._ensure_guild_state(guild.id)
+            guild_state.schedule_runs[schedule.id] = today_iso
             await self.save_state()
 
         await self._notify_logger(
-            f"Scheduled giveaway `{schedule.id}` triggered as `{giveaway.id}`."
+            f"Scheduled giveaway `{schedule.id}` triggered as `{giveaway.id}`.",
+            guild_id=guild.id,
         )
 
     async def _update_embed(self, giveaway: Giveaway) -> None:
@@ -571,8 +740,8 @@ class GiveawayManager:
     async def _schedule_start(
         self, pending: PendingGiveaway, *, reschedule: bool = True
     ) -> None:
-        if reschedule and pending.id in self._start_tasks:
-            self._start_tasks[pending.id].cancel()
+        if reschedule and pending.id in self._pending_tasks:
+            self._pending_tasks[pending.id].cancel()
 
         async def runner() -> None:
             try:
@@ -580,19 +749,203 @@ class GiveawayManager:
                 delay = (pending.start_time - now).total_seconds()
                 if delay > 0:
                     await asyncio.sleep(delay)
-                await self._start_pending_giveaway(pending.id)
+                await self._start_pending_giveaway(pending.guild_id, pending.id)
             except asyncio.CancelledError:
                 log.debug("Start task for pending giveaway %s cancelled", pending.id)
                 raise
             finally:
-                self._start_tasks.pop(pending.id, None)
+                self._pending_tasks.pop(pending.id, None)
 
         task = asyncio.create_task(runner())
-        self._start_tasks[pending.id] = task
+        self._pending_tasks[pending.id] = task
 
-    async def _start_pending_giveaway(self, pending_id: str) -> None:
+    def _compute_next_window(
+        self,
+        guild_id: int,
+        start_time_value: time,
+        end_time_value: time,
+        reference: Optional[datetime] = None,
+    ) -> tuple[datetime, datetime]:
+        tz = self.get_timezone(guild_id)
+        if reference is None:
+            reference_local = datetime.now(tz=tz)
+        else:
+            reference_local = reference.astimezone(tz)
+        start_local = datetime.combine(reference_local.date(), start_time_value, tzinfo=tz)
+        if start_local <= reference_local:
+            start_local += timedelta(days=1)
+        end_local = datetime.combine(start_local.date(), end_time_value, tzinfo=tz)
+        if end_local <= start_local:
+            end_local += timedelta(days=1)
+        return start_local.astimezone(UTC), end_local.astimezone(UTC)
+
+    async def _schedule_recurring(
+        self, recurring: "RecurringGiveaway", *, reschedule: bool = True
+    ) -> None:
+        if reschedule:
+            task = self._recurring_tasks.pop(recurring.id, None)
+            if task:
+                task.cancel()
+        if not recurring.enabled:
+            return
+
+        delay = (recurring.next_start - datetime.now(tz=UTC)).total_seconds()
+        if delay < 0:
+            delay = 0
+
+        async def runner() -> None:
+            try:
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                await self._run_recurring(recurring.guild_id, recurring.id)
+            except asyncio.CancelledError:
+                log.debug("Recurring task for %s cancelled", recurring.id)
+                raise
+            finally:
+                self._recurring_tasks.pop(recurring.id, None)
+
+        self._recurring_tasks[recurring.id] = asyncio.create_task(runner())
+
+    async def _run_recurring(self, guild_id: int, schedule_id: str) -> None:
         async with self._state_lock:
-            pending = self.state.get_pending(pending_id)
+            recurring = self.state.get_recurring(guild_id, schedule_id)
+        if not recurring or not recurring.enabled:
+            return
+
+        channel = await self._fetch_text_channel(recurring.channel_id)
+        if not channel or not isinstance(channel, discord.TextChannel):
+            log.warning(
+                "Recurring giveaway %s channel %s unavailable; disabling schedule.",
+                schedule_id,
+                recurring.channel_id,
+            )
+            await self.disable_recurring(guild_id, schedule_id)
+            return
+
+        guild = channel.guild
+        try:
+            giveaway = await self.start_giveaway(
+                guild,
+                channel,
+                winners=recurring.winners,
+                title=recurring.title,
+                description=recurring.description,
+                end_time=recurring.next_end,
+                scheduled_id=schedule_id,
+            )
+        except Exception:
+            log.exception("Failed to start recurring giveaway %s", schedule_id)
+            next_start, next_end = self._compute_next_window(
+                guild_id, recurring.start_time, recurring.end_time
+            )
+            async with self._state_lock:
+                latest = self.state.get_recurring(guild_id, schedule_id)
+                if latest:
+                    latest.next_start = next_start
+                    latest.next_end = next_end
+                    self.state.upsert_recurring(guild_id, latest)
+                    await self.save_state()
+                    recurring = latest
+            if recurring.enabled:
+                await self._schedule_recurring(recurring, reschedule=True)
+            return
+
+        tz = self.get_timezone(guild_id)
+        next_start_utc, next_end_utc = self._compute_next_window(
+            guild_id, recurring.start_time, recurring.end_time, reference=datetime.now(tz=tz)
+        )
+
+        async with self._state_lock:
+            latest = self.state.get_recurring(guild_id, schedule_id)
+            if not latest:
+                return
+            latest.next_start = next_start_utc
+            latest.next_end = next_end_utc
+            self.state.upsert_recurring(guild_id, latest)
+            await self.save_state()
+
+        await self._schedule_recurring(latest, reschedule=True)
+        await self._notify_logger(
+            f"Scheduled giveaway `{schedule_id}` started as `{giveaway.id}`.",
+            guild_id=guild_id,
+        )
+
+    async def set_timezone(self, guild_id: int, timezone_name: str) -> None:
+        try:
+            ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"Invalid timezone: {timezone_name}") from exc
+
+        async with self._state_lock:
+            guild_state = self._ensure_guild_state(guild_id)
+            if guild_state.timezone == timezone_name:
+                return
+            guild_state.timezone = timezone_name
+            recurring_items = list(guild_state.recurring_giveaways)
+            for recurring in recurring_items:
+                next_start, next_end = self._compute_next_window(
+                    guild_id, recurring.start_time, recurring.end_time
+                )
+                recurring.next_start = next_start
+                recurring.next_end = next_end
+                task = self._recurring_tasks.pop(recurring.id, None)
+                if task:
+                    task.cancel()
+            await self.save_state()
+
+        for recurring in recurring_items:
+            if recurring.enabled:
+                await self._schedule_recurring(recurring, reschedule=False)
+
+    async def get_recurring_giveaway(
+        self, guild_id: int, schedule_id: str
+    ) -> Optional[RecurringGiveaway]:
+        async with self._state_lock:
+            return self.state.get_recurring(guild_id, schedule_id)
+
+    async def disable_recurring(self, guild_id: int, schedule_id: str) -> str:
+        async with self._state_lock:
+            recurring = self.state.get_recurring(guild_id, schedule_id)
+            if not recurring:
+                return "not_found"
+            if not recurring.enabled:
+                return "already_disabled"
+            recurring.enabled = False
+            self.state.upsert_recurring(guild_id, recurring)
+            task = self._recurring_tasks.pop(schedule_id, None)
+            if task:
+                task.cancel()
+            await self.save_state()
+        await self._notify_logger(
+            f"Scheduled giveaway `{schedule_id}` disabled.", guild_id=guild_id
+        )
+        return "disabled"
+
+    async def enable_recurring(self, guild_id: int, schedule_id: str) -> str:
+        async with self._state_lock:
+            recurring = self.state.get_recurring(guild_id, schedule_id)
+            if not recurring:
+                return "not_found"
+            if recurring.enabled:
+                return "already_enabled"
+            recurring.enabled = True
+            next_start, next_end = self._compute_next_window(
+                guild_id, recurring.start_time, recurring.end_time
+            )
+            recurring.next_start = next_start
+            recurring.next_end = next_end
+            self.state.upsert_recurring(guild_id, recurring)
+            await self.save_state()
+
+        await self._schedule_recurring(recurring, reschedule=True)
+        await self._notify_logger(
+            f"Scheduled giveaway `{schedule_id}` enabled.", guild_id=guild_id
+        )
+        return "enabled"
+
+    async def _start_pending_giveaway(self, guild_id: int, pending_id: str) -> None:
+        async with self._state_lock:
+            pending = self.state.get_pending(guild_id, pending_id)
         if not pending:
             return
 
@@ -604,11 +957,12 @@ class GiveawayManager:
                 pending.channel_id,
             )
             async with self._state_lock:
-                removed = self.state.remove_pending(pending_id)
+                removed = self.state.remove_pending(guild_id, pending_id)
                 if removed:
                     await self.save_state()
             await self._notify_logger(
-                f"Scheduled giveaway `{pending_id}` could not start because channel <#{pending.channel_id}> is unavailable."
+                f"Scheduled giveaway `{pending_id}` could not start because channel <#{pending.channel_id}> is unavailable.",
+                guild_id=guild_id,
             )
             return
 
@@ -625,21 +979,23 @@ class GiveawayManager:
         except Exception:
             log.exception("Failed to start pending giveaway %s", pending_id)
             async with self._state_lock:
-                removed = self.state.remove_pending(pending_id)
+                removed = self.state.remove_pending(guild_id, pending_id)
                 if removed:
                     await self.save_state()
             await self._notify_logger(
-                f"Scheduled giveaway `{pending_id}` failed to start. Check logs for details."
+                f"Scheduled giveaway `{pending_id}` failed to start. Check logs for details.",
+                guild_id=guild_id,
             )
             return
 
         async with self._state_lock:
-            removed = self.state.remove_pending(pending_id)
+            removed = self.state.remove_pending(guild_id, pending_id)
             if removed:
                 await self.save_state()
 
         await self._notify_logger(
-            f"Scheduled giveaway `{pending_id}` started as `{giveaway.id}`."
+            f"Scheduled giveaway `{pending_id}` started as `{giveaway.id}`.",
+            guild_id=guild_id,
         )
 
     async def _schedule_finish(
@@ -654,23 +1010,29 @@ class GiveawayManager:
         now = datetime.now(tz=UTC)
         delay = (giveaway.end_time - now).total_seconds()
         if delay <= 0:
-            asyncio.create_task(self.end_giveaway(giveaway.id))
+            asyncio.create_task(self.end_giveaway(giveaway.guild_id, giveaway.id))
             return
 
         async def waiter():
             try:
                 await asyncio.sleep(delay)
-                await self.end_giveaway(giveaway.id)
+                await self.end_giveaway(giveaway.guild_id, giveaway.id)
             except asyncio.CancelledError:
                 log.debug("Finish task for giveaway %s cancelled", giveaway.id)
 
         task = asyncio.create_task(waiter())
         self._finish_tasks[giveaway.id] = task
 
-    async def _notify_logger(self, message: str) -> None:
-        channel_id = (
-            self.state.logger_channel_id or self.config.logging.logger_channel_id
-        )
+    async def _notify_logger(
+        self, message: str, *, guild_id: Optional[int] = None
+    ) -> None:
+        channel_id: Optional[int] = None
+        if guild_id is not None:
+            guild_state = self.state.get_guild_state(guild_id)
+            if guild_state and guild_state.logger_channel_id:
+                channel_id = guild_state.logger_channel_id
+        if not channel_id:
+            channel_id = self.config.logging.logger_channel_id
         if not channel_id:
             return
         channel = await self._fetch_text_channel(channel_id)
@@ -714,6 +1076,7 @@ class GiveawayManager:
         end_time: datetime,
         status: str,
         winner_mentions: Optional[str] = None,
+        tz: ZoneInfo,
     ) -> discord.Embed:
         embed = discord.Embed(
             title=title,
@@ -724,7 +1087,7 @@ class GiveawayManager:
         )
         embed.add_field(name="Winners", value=str(winners), inline=True)
         embed.add_field(name="Participants", value=str(participants), inline=True)
-        end_local = end_time.astimezone(self.timezone)
+        end_local = end_time.astimezone(tz)
         embed.add_field(
             name="Ends At", value=end_local.strftime("%Y-%m-%d %H:%M %Z"), inline=False
         )
@@ -746,6 +1109,7 @@ class GiveawayManager:
         winner_mentions = None
         if winners:
             winner_mentions = " ".join(f"<@{winner_id}>" for winner_id in winners)
+        tz = self.get_timezone(giveaway.guild_id)
         return self._build_embed(
             giveaway=giveaway,
             title=giveaway.title,
@@ -755,6 +1119,7 @@ class GiveawayManager:
             end_time=giveaway.end_time,
             status=resolved_status,
             winner_mentions=winner_mentions,
+            tz=tz,
         )
 
     def _generate_giveaway_id(self) -> str:

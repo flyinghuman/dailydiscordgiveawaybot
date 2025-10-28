@@ -39,7 +39,11 @@ class GiveawayView(discord.ui.View):
                 "You can only join giveaways from a guild.", ephemeral=True
             )
             return
-        response = await self.manager.add_participant(self.giveaway_id, interaction.user)
+        response = await self.manager.add_participant(
+            interaction.guild.id,
+            self.giveaway_id,
+            interaction.user,
+        )
         await interaction.response.send_message(response, ephemeral=True)
 
     async def leave_callback(self, interaction: discord.Interaction) -> None:
@@ -48,7 +52,11 @@ class GiveawayView(discord.ui.View):
                 "You must be part of the guild to leave the giveaway.", ephemeral=True
             )
             return
-        response = await self.manager.remove_participant(self.giveaway_id, interaction.user)
+        response = await self.manager.remove_participant(
+            interaction.guild.id,
+            self.giveaway_id,
+            interaction.user,
+        )
         await interaction.response.send_message(response, ephemeral=True)
 
     async def info_callback(self, interaction: discord.Interaction) -> None:
@@ -65,7 +73,9 @@ class GiveawayView(discord.ui.View):
                 "Only administrators can view the participant list.", ephemeral=True
             )
             return
-        giveaway = await self.manager.get_giveaway(self.giveaway_id)
+        giveaway = await self.manager.get_giveaway(
+            interaction.guild.id, self.giveaway_id
+        )
         if not giveaway:
             await interaction.response.send_message("Giveaway not found.", ephemeral=True)
             return

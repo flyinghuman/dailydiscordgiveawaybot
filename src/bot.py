@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 import re
 from pathlib import Path
 from typing import Optional
-from zoneinfo import ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
 from discord import app_commands
@@ -266,12 +266,12 @@ def build_bot(config_path: Path) -> GiveawayBot:
         raise ConfigError(f"Invalid timezone configured: {config.default_timezone}") from exc
 
 
-def _parse_end_time(value: str, manager: GiveawayManager) -> datetime:
+def _parse_end_time(value: str, tz: ZoneInfo) -> datetime:
     value = value.strip()
     for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
         try:
             naive = datetime.strptime(value, fmt)
-            return naive.replace(tzinfo=manager.timezone).astimezone(UTC)
+            return naive.replace(tzinfo=tz).astimezone(UTC)
         except ValueError:
             continue
     raise ValueError("Time must be in 'YYYY-MM-DD HH:MM' (24h) format.")
@@ -279,6 +279,40 @@ def _parse_end_time(value: str, manager: GiveawayManager) -> datetime:
 
 def register_commands(bot: GiveawayBot) -> None:
     manager = bot.manager
+
+    @bot.tree.command(
+        name="giveaway-set-timezone",
+        description="Set the timezone used for giveaways on this server.",
+    )
+    @app_commands.describe(
+        timezone="IANA timezone name, e.g. Europe/Berlin or America/New_York."
+    )
+    async def giveaway_set_timezone(
+        interaction: discord.Interaction, timezone: str
+    ) -> None:
+        error = await admin_required(interaction, manager)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a guild.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await manager.set_timezone(interaction.guild.id, timezone.strip())
+        except ValueError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+
+        tz = manager.get_timezone(interaction.guild.id)
+        current_local = datetime.now(tz=tz)
+        await interaction.followup.send(
+            f"Timezone updated to `{timezone.strip()}`. Local time is now {current_local:%Y-%m-%d %H:%M %Z}.",
+            ephemeral=True,
+        )
 
     @bot.tree.command(name="giveaway-start", description="Start a new giveaway.")
     @app_commands.describe(
@@ -288,6 +322,7 @@ def register_commands(bot: GiveawayBot) -> None:
         description="Description for the giveaway.",
         start="Start time in HH:MM (24h) to begin the giveaway.",
         end="End time in HH:MM (24h) to finish the giveaway.",
+        run_daily="Automatically repeat this giveaway every day at the provided times.",
     )
     async def giveaway_start(
         interaction: discord.Interaction,
@@ -297,6 +332,7 @@ def register_commands(bot: GiveawayBot) -> None:
         description: str,
         start: str,
         end: str,
+        run_daily: bool = False,
     ) -> None:
         error = await admin_required(interaction, manager)
         if error:
@@ -339,10 +375,11 @@ def register_commands(bot: GiveawayBot) -> None:
             )
             return
 
-        now_local = datetime.now(tz=manager.timezone)
+        tz = manager.get_timezone(interaction.guild.id)
+        now_local = datetime.now(tz=tz)
         tolerance = timedelta(minutes=1)
         scheduled_start_local = datetime.combine(
-            now_local.date(), start_hhmm, tzinfo=manager.timezone
+            now_local.date(), start_hhmm, tzinfo=tz
         )
         if scheduled_start_local + tolerance < now_local:
             scheduled_start_local += timedelta(days=1)
@@ -350,7 +387,7 @@ def register_commands(bot: GiveawayBot) -> None:
         effective_start_local = now_local if immediate else scheduled_start_local
 
         scheduled_end_local = datetime.combine(
-            scheduled_start_local.date(), end_hhmm, tzinfo=manager.timezone
+            scheduled_start_local.date(), end_hhmm, tzinfo=tz
         )
         if scheduled_end_local <= scheduled_start_local:
             scheduled_end_local += timedelta(days=1)
@@ -358,6 +395,48 @@ def register_commands(bot: GiveawayBot) -> None:
             scheduled_end_local += timedelta(days=1)
 
         await interaction.response.defer(ephemeral=True)
+
+        if run_daily:
+            started_now = None
+            if immediate:
+                started_now = await manager.start_giveaway(
+                    guild=interaction.guild,  # type: ignore[arg-type]
+                    channel=target_channel,
+                    winners=winners,
+                    title=title,
+                    description=description,
+                    end_time=scheduled_end_local.astimezone(UTC),
+                )
+            recurring = await manager.schedule_recurring_giveaway(
+                interaction.guild,  # type: ignore[arg-type]
+                target_channel,
+                winners=winners,
+                title=title,
+                description=description,
+                start_local=scheduled_start_local,
+                end_local=scheduled_end_local,
+                immediate_started=immediate,
+            )
+
+            lines = []
+            if started_now:
+                lines.append(
+                    f"Giveaway `{started_now.id}` started immediately in {target_channel.mention} "
+                    f"and will end at {started_now.end_time.astimezone(tz):%Y-%m-%d %H:%M %Z}."
+                )
+            else:
+                lines.append(
+                    f"Recurring giveaway scheduled for {scheduled_start_local:%Y-%m-%d %H:%M %Z} in {target_channel.mention}."
+                )
+            next_run = recurring.next_start.astimezone(tz)
+            lines.append(
+                f"Recurring schedule ID: `{recurring.id}`. Next run: {next_run:%Y-%m-%d %H:%M %Z}."
+            )
+            lines.append(
+                "Use /giveaway-disable with the schedule ID to pause daily runs."
+            )
+            await interaction.followup.send("\n".join(lines), ephemeral=True)
+            return
 
         if immediate:
             giveaway = await manager.start_giveaway(
@@ -370,7 +449,7 @@ def register_commands(bot: GiveawayBot) -> None:
             )
             await interaction.followup.send(
                 f"Giveaway `{giveaway.id}` started immediately in {target_channel.mention} "
-                f"and will end at {giveaway.end_time.astimezone(manager.timezone):%Y-%m-%d %H:%M %Z}.",
+                f"and will end at {giveaway.end_time.astimezone(tz):%Y-%m-%d %H:%M %Z}.",
                 ephemeral=True,
             )
         else:
@@ -398,8 +477,14 @@ def register_commands(bot: GiveawayBot) -> None:
             await interaction.response.send_message(error, ephemeral=True)
             return
 
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a guild.", ephemeral=True
+            )
+            return
+
         await interaction.response.defer(ephemeral=True)
-        giveaway = await manager.end_giveaway(giveaway_id)
+        giveaway = await manager.end_giveaway(interaction.guild.id, giveaway_id)
         if not giveaway:
             await interaction.followup.send("Giveaway not found.", ephemeral=True)
             return
@@ -428,12 +513,19 @@ def register_commands(bot: GiveawayBot) -> None:
             await interaction.response.send_message(error, ephemeral=True)
             return
 
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a guild.", ephemeral=True
+            )
+            return
+
         await interaction.response.defer(ephemeral=True)
 
+        tz = manager.get_timezone(interaction.guild.id)
         new_end_time = None
         if end_time:
             try:
-                new_end_time = _parse_end_time(end_time, manager)
+                new_end_time = _parse_end_time(end_time, tz)
             except ValueError as exc:
                 await interaction.followup.send(str(exc), ephemeral=True)
                 return
@@ -446,6 +538,7 @@ def register_commands(bot: GiveawayBot) -> None:
             winners_value = int(winners)
         try:
             giveaway = await manager.update_giveaway(
+                interaction.guild.id,
                 giveaway_id,
                 winners=winners_value,
                 title=title,
@@ -473,16 +566,17 @@ def register_commands(bot: GiveawayBot) -> None:
             )
             return
         await interaction.response.defer(ephemeral=True)
-        giveaways = await manager.list_giveaways()
+        giveaways = await manager.list_giveaways(interaction.guild.id)
         if not giveaways:
             await interaction.followup.send(
                 "No giveaways have been created yet.", ephemeral=True
             )
             return
+        tz = manager.get_timezone(interaction.guild.id)
         lines = []
         for giveaway in giveaways:
             status = "Active" if giveaway.is_active else "Finished"
-            end_time = giveaway.end_time.astimezone(manager.timezone).strftime(
+            end_time = giveaway.end_time.astimezone(tz).strftime(
                 "%Y-%m-%d %H:%M %Z"
             )
             lines.append(
@@ -504,7 +598,12 @@ def register_commands(bot: GiveawayBot) -> None:
             await interaction.response.send_message(error, ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        giveaway = await manager.get_giveaway(giveaway_id)
+        if not interaction.guild:
+            await interaction.followup.send(
+                "This command can only be used in a guild.", ephemeral=True
+            )
+            return
+        giveaway = await manager.get_giveaway(interaction.guild.id, giveaway_id)
         if not giveaway:
             await interaction.followup.send("Giveaway not found.", ephemeral=True)
             return
@@ -529,8 +628,14 @@ def register_commands(bot: GiveawayBot) -> None:
             await interaction.response.send_message(error, ephemeral=True)
             return
 
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a guild.", ephemeral=True
+            )
+            return
+
         await interaction.response.defer(ephemeral=True)
-        giveaway = await manager.get_giveaway(giveaway_id)
+        giveaway = await manager.get_giveaway(interaction.guild.id, giveaway_id)
         if not giveaway:
             await interaction.followup.send("Giveaway not found.", ephemeral=True)
             return
@@ -540,7 +645,7 @@ def register_commands(bot: GiveawayBot) -> None:
             )
             return
 
-        winners = await manager.reroll(giveaway_id)
+        winners = await manager.reroll(interaction.guild.id, giveaway_id)
         if not winners:
             await interaction.followup.send(
                 "No participants available to reroll.", ephemeral=True
@@ -597,7 +702,7 @@ def register_commands(bot: GiveawayBot) -> None:
             return
 
         await interaction.response.defer(ephemeral=True)
-        await manager.set_logger_channel(target_channel.id)
+        await manager.set_logger_channel(interaction.guild.id, target_channel.id)
         await interaction.followup.send(
             f"Logger channel set to {target_channel.mention}.", ephemeral=True
         )
@@ -611,8 +716,14 @@ def register_commands(bot: GiveawayBot) -> None:
         if error:
             await interaction.response.send_message(error, ephemeral=True)
             return
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a guild.", ephemeral=True
+            )
+            return
+
         await interaction.response.defer(ephemeral=True)
-        removed = await manager.cleanup_finished()
+        removed = await manager.cleanup_finished(interaction.guild.id)
         if removed == 0:
             await interaction.followup.send(
                 "No finished giveaways found to remove.", ephemeral=True
@@ -641,7 +752,7 @@ def register_commands(bot: GiveawayBot) -> None:
 
         await interaction.response.defer(ephemeral=True)
 
-        giveaway = await manager.get_giveaway(giveaway_id)
+        giveaway = await manager.get_giveaway(interaction.guild.id, giveaway_id)
         if giveaway:
             status_text = "Active" if giveaway.is_active else "Finished"
             color = discord.Color.blue() if giveaway.is_active else discord.Color.dark_gray()
@@ -658,13 +769,14 @@ def register_commands(bot: GiveawayBot) -> None:
                 name="Participant Count", value=str(len(giveaway.participants)), inline=True
             )
 
-            created_local = giveaway.created_at.astimezone(manager.timezone)
+            tz = manager.get_timezone(interaction.guild.id)
+            created_local = giveaway.created_at.astimezone(tz)
             embed.add_field(
                 name="Created At",
                 value=created_local.strftime("%Y-%m-%d %H:%M %Z"),
                 inline=False,
             )
-            end_local = giveaway.end_time.astimezone(manager.timezone)
+            end_local = giveaway.end_time.astimezone(tz)
             embed.add_field(
                 name="Ends At", value=end_local.strftime("%Y-%m-%d %H:%M %Z"), inline=False
             )
@@ -704,7 +816,7 @@ def register_commands(bot: GiveawayBot) -> None:
             await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
-        pending = await manager.get_pending_giveaway(giveaway_id)
+        pending = await manager.get_pending_giveaway(interaction.guild.id, giveaway_id)
         if pending:
             embed = discord.Embed(
                 title=pending.title,
@@ -715,13 +827,50 @@ def register_commands(bot: GiveawayBot) -> None:
             embed.add_field(name="Channel", value=f"<#{pending.channel_id}>", inline=True)
             embed.add_field(name="Planned Winners", value=str(pending.winners), inline=True)
 
-            start_local = pending.start_time.astimezone(manager.timezone)
-            end_local = pending.end_time.astimezone(manager.timezone)
+            tz = manager.get_timezone(interaction.guild.id)
+            start_local = pending.start_time.astimezone(tz)
+            end_local = pending.end_time.astimezone(tz)
             embed.add_field(
                 name="Starts At", value=start_local.strftime("%Y-%m-%d %H:%M %Z"), inline=False
             )
             embed.add_field(
                 name="Ends At", value=end_local.strftime("%Y-%m-%d %H:%M %Z"), inline=False
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        recurring = await manager.get_recurring_giveaway(
+            interaction.guild.id, giveaway_id
+        )
+        if recurring:
+            tz = manager.get_timezone(interaction.guild.id)
+            start_local = datetime.combine(
+                datetime.now(tz=tz).date(), recurring.start_time, tzinfo=tz
+            )
+            end_local = datetime.combine(
+                start_local.date(), recurring.end_time, tzinfo=tz
+            )
+            if end_local <= start_local:
+                end_local += timedelta(days=1)
+            next_run = recurring.next_start.astimezone(tz)
+            next_end = recurring.next_end.astimezone(tz)
+            embed = discord.Embed(
+                title=recurring.title,
+                description=recurring.description or "No description provided.",
+                color=discord.Color.green() if recurring.enabled else discord.Color.dark_gray(),
+            )
+            embed.add_field(name="Status", value="Enabled" if recurring.enabled else "Disabled", inline=True)
+            embed.add_field(name="Channel", value=f"<#{recurring.channel_id}>", inline=True)
+            embed.add_field(name="Planned Winners", value=str(recurring.winners), inline=True)
+            embed.add_field(
+                name="Daily Window",
+                value=f"Starts {recurring.start_time.strftime('%H:%M')} - Ends {recurring.end_time.strftime('%H:%M')} ({getattr(tz, 'key', str(tz))})",
+                inline=False,
+            )
+            embed.add_field(
+                name="Next Run",
+                value=f"{next_run:%Y-%m-%d %H:%M %Z} → {next_end:%Y-%m-%d %H:%M %Z}",
+                inline=False,
             )
             await interaction.followup.send(embed=embed, ephemeral=True)
             return
@@ -740,8 +889,14 @@ def register_commands(bot: GiveawayBot) -> None:
         if error:
             await interaction.response.send_message(error, ephemeral=True)
             return
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a guild.", ephemeral=True
+            )
+            return
+
         await interaction.response.defer(ephemeral=True)
-        added = await manager.add_admin_role(role.id)
+        added = await manager.add_admin_role(interaction.guild.id, role.id)
         if not added:
             await interaction.followup.send(
                 f"{role.mention} already has giveaway admin permissions.",
@@ -765,8 +920,14 @@ def register_commands(bot: GiveawayBot) -> None:
         if error:
             await interaction.response.send_message(error, ephemeral=True)
             return
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a guild.", ephemeral=True
+            )
+            return
+
         await interaction.response.defer(ephemeral=True)
-        removed = await manager.remove_admin_role(role.id)
+        removed = await manager.remove_admin_role(interaction.guild.id, role.id)
         if not removed:
             await interaction.followup.send(
                 f"{role.mention} does not have giveaway admin permissions.",
@@ -794,7 +955,7 @@ def register_commands(bot: GiveawayBot) -> None:
             return
 
         await interaction.response.defer(ephemeral=True)
-        role_ids = await manager.list_admin_roles()
+        role_ids = await manager.list_admin_roles(interaction.guild.id)
         if not role_ids:
             await interaction.followup.send(
                 "No extra giveaway admin roles are configured.", ephemeral=True
@@ -812,28 +973,92 @@ def register_commands(bot: GiveawayBot) -> None:
         await interaction.followup.send("\n".join(lines), ephemeral=True)
 
     @bot.tree.command(
-        name="giveaway-enable", description="Enable automatic scheduled giveaways."
+        name="giveaway-enable",
+        description="Enable a recurring giveaway schedule.",
     )
-    async def giveaway_enable(interaction: discord.Interaction) -> None:
+    @app_commands.describe(
+        schedule_id="Identifier of the recurring giveaway schedule to enable."
+    )
+    async def giveaway_enable(
+        interaction: discord.Interaction, schedule_id: str
+    ) -> None:
         error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
             return
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a guild.", ephemeral=True
+            )
+            return
+
         await interaction.response.defer(ephemeral=True)
-        await manager.toggle_auto(True)
-        await interaction.followup.send("Automatic giveaways enabled.", ephemeral=True)
+        result = await manager.enable_recurring(interaction.guild.id, schedule_id.strip())
+        if result == "not_found":
+            await interaction.followup.send(
+                "No recurring giveaway with that ID was found for this server.",
+                ephemeral=True,
+            )
+            return
+        if result == "already_enabled":
+            await interaction.followup.send(
+                "That recurring giveaway is already enabled.", ephemeral=True
+            )
+            return
+
+        recurring = await manager.get_recurring_giveaway(
+            interaction.guild.id, schedule_id.strip()
+        )
+        tz = manager.get_timezone(interaction.guild.id)
+        next_run = (
+            recurring.next_start.astimezone(tz)
+            if recurring
+            else None
+        )
+        message = "Recurring giveaway enabled."
+        if next_run:
+            message += f" Next run: {next_run:%Y-%m-%d %H:%M %Z}."
+        await interaction.followup.send(message, ephemeral=True)
 
     @bot.tree.command(
-        name="giveaway-disable", description="Disable automatic scheduled giveaways."
+        name="giveaway-disable",
+        description="Disable a recurring giveaway schedule.",
     )
-    async def giveaway_disable(interaction: discord.Interaction) -> None:
+    @app_commands.describe(
+        schedule_id="Identifier of the recurring giveaway schedule to disable."
+    )
+    async def giveaway_disable(
+        interaction: discord.Interaction, schedule_id: str
+    ) -> None:
         error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
             return
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a guild.", ephemeral=True
+            )
+            return
+
         await interaction.response.defer(ephemeral=True)
-        await manager.toggle_auto(False)
-        await interaction.followup.send("Automatic giveaways disabled.", ephemeral=True)
+        result = await manager.disable_recurring(
+            interaction.guild.id, schedule_id.strip()
+        )
+        if result == "not_found":
+            await interaction.followup.send(
+                "No recurring giveaway with that ID was found for this server.",
+                ephemeral=True,
+            )
+            return
+        if result == "already_disabled":
+            await interaction.followup.send(
+                "That recurring giveaway is already disabled.", ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            "Recurring giveaway disabled. Use /giveaway-enable to resume it.",
+            ephemeral=True,
+        )
 
 
 async def main() -> None:

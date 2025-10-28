@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
+import re
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfoNotFoundError
@@ -17,7 +18,113 @@ from .giveaway_manager import GiveawayManager
 from .storage import StateStorage
 
 
+CHANNEL_MENTION_RE = re.compile(r"^<#?(\d+)>?$")
+
+
+class ChannelResolutionError(RuntimeError):
+    """Raised when a provided channel value cannot be resolved."""
+
+
 PERMISSION_LOG = logging.getLogger("giveaway.permissions")
+
+
+async def _resolve_text_channel(
+    bot: discord.Client,
+    guild: discord.Guild,
+    value: str,
+    *,
+    resolved: Optional[dict[str, dict]] = None,
+) -> discord.TextChannel:
+    if not value:
+        raise ChannelResolutionError(
+            "No channel value was provided. Use a mention, ID, or exact name."
+        )
+
+    value = value.strip()
+
+    resolved_map = resolved or {}
+    if resolved_map:
+        possible_keys = (
+            value,
+            value.lstrip("#"),
+        )
+        resolved_channel = None
+        for key in possible_keys:
+            resolved_channel = resolved_map.get(key)
+            if resolved_channel:
+                break
+        if not resolved_channel:
+            lookup_name = value.lstrip("#").lower()
+            for candidate in resolved_map.values():
+                if candidate.get("name", "").lower() == lookup_name:
+                    resolved_channel = candidate
+                    break
+        if resolved_channel:
+            value = str(resolved_channel.get("id", value))
+
+    channel_id: Optional[int] = None
+    mention_match = CHANNEL_MENTION_RE.match(value)
+    if mention_match:
+        channel_id = int(mention_match.group(1))
+    elif value.isdigit():
+        channel_id = int(value)
+
+    def _validate_channel(obj: Optional[discord.abc.GuildChannel]) -> Optional[discord.TextChannel]:
+        if isinstance(obj, discord.TextChannel) and obj.guild.id == guild.id:
+            return obj
+        return None
+
+    if channel_id is not None:
+        cached_channel = _validate_channel(guild.get_channel(channel_id))
+        if cached_channel:
+            return cached_channel
+        cached_channel = _validate_channel(bot.get_channel(channel_id))
+        if cached_channel:
+            return cached_channel
+        try:
+            fetched = await guild.fetch_channel(channel_id)
+        except discord.Forbidden as exc:
+            raise ChannelResolutionError(
+                "I do not have permission to access that channel. Update the channel permissions or choose a different one."
+            ) from exc
+        except (discord.NotFound, discord.HTTPException) as exc:
+            fetched = None
+        validated = _validate_channel(fetched) if fetched else None
+        if validated:
+            return validated
+
+    lookup = value.lstrip("#").lower()
+    for text_channel in guild.text_channels:
+        if text_channel.name.lower() == lookup:
+            return text_channel
+
+    if resolved_map:
+        for candidate in resolved_map.values():
+            if candidate.get("name", "").lower() == lookup:
+                try:
+                    candidate_id = int(candidate["id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                cached_channel = _validate_channel(guild.get_channel(candidate_id))
+                if cached_channel:
+                    return cached_channel
+                cached_channel = _validate_channel(bot.get_channel(candidate_id))
+                if cached_channel:
+                    return cached_channel
+                try:
+                    fetched = await guild.fetch_channel(candidate_id)
+                except discord.Forbidden as exc:
+                    raise ChannelResolutionError(
+                        "I do not have permission to access that channel. Update the channel permissions or choose a different one."
+                    ) from exc
+                except (discord.NotFound, discord.HTTPException):
+                    continue
+                validated = _validate_channel(fetched) if fetched else None
+                if validated:
+                    return validated
+    raise ChannelResolutionError(
+        "Could not resolve the provided channel. Use a mention, ID, or exact name."
+    )
 
 def configure_logging(level: str) -> None:
     console_level = getattr(logging, level.upper(), logging.INFO)
@@ -178,7 +285,7 @@ def register_commands(bot: GiveawayBot) -> None:
     )
     async def giveaway_start(
         interaction: discord.Interaction,
-        channel: discord.TextChannel,
+        channel: str,
         winners: app_commands.Range[int, 1, 100],
         title: str,
         description: str,
@@ -194,6 +301,27 @@ def register_commands(bot: GiveawayBot) -> None:
             )
             return
 
+        resolved_channels = None
+        try:
+            resolved_channels = (
+                interaction.data.get("resolved", {}).get("channels", {})  # type: ignore[assignment]
+                if isinstance(interaction.data, dict)
+                else None
+            )
+        except AttributeError:
+            resolved_channels = None
+
+        try:
+            target_channel = await _resolve_text_channel(
+                bot,
+                interaction.guild,
+                channel,
+                resolved=resolved_channels,
+            )
+        except ChannelResolutionError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
         await interaction.response.defer(ephemeral=True)
 
         end_time = datetime.now(tz=UTC) + timedelta(
@@ -202,7 +330,7 @@ def register_commands(bot: GiveawayBot) -> None:
 
         giveaway = await manager.start_giveaway(
             guild=interaction.guild,  # type: ignore[arg-type]
-            channel=channel,
+            channel=target_channel,
             winners=winners,
             title=title,
             description=description,
@@ -210,7 +338,7 @@ def register_commands(bot: GiveawayBot) -> None:
         )
 
         await interaction.followup.send(
-            f"Giveaway `{giveaway.id}` created in {channel.mention} and ending at "
+            f"Giveaway `{giveaway.id}` created in {target_channel.mention} and ending at "
             f"{giveaway.end_time.astimezone(manager.timezone):%Y-%m-%d %H:%M %Z}.",
             ephemeral=True,
         )
@@ -388,7 +516,7 @@ def register_commands(bot: GiveawayBot) -> None:
         channel="Channel where log messages should be posted (mention, ID, or name)."
     )
     async def giveaway_logger(
-        interaction: discord.Interaction, channel: discord.TextChannel
+        interaction: discord.Interaction, channel: str
     ) -> None:
         error = await admin_required(interaction, manager)
         if error:
@@ -400,10 +528,31 @@ def register_commands(bot: GiveawayBot) -> None:
             )
             return
 
+        resolved_channels = None
+        try:
+            resolved_channels = (
+                interaction.data.get("resolved", {}).get("channels", {})  # type: ignore[assignment]
+                if isinstance(interaction.data, dict)
+                else None
+            )
+        except AttributeError:
+            resolved_channels = None
+
+        try:
+            target_channel = await _resolve_text_channel(
+                bot,
+                interaction.guild,
+                channel,
+                resolved=resolved_channels,
+            )
+        except ChannelResolutionError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
         await interaction.response.defer(ephemeral=True)
-        await manager.set_logger_channel(channel.id)
+        await manager.set_logger_channel(target_channel.id)
         await interaction.followup.send(
-            f"Logger channel set to {channel.mention}.", ephemeral=True
+            f"Logger channel set to {target_channel.mention}.", ephemeral=True
         )
 
     @bot.tree.command(

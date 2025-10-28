@@ -27,7 +27,7 @@ class ManualDefaults:
 class ScheduledGiveawayConfig:
     id: str
     enabled: bool
-    channel_id: int
+    channel_id: Optional[int]
     winners: int
     title: str
     description: str
@@ -101,10 +101,12 @@ def _parse_manual_defaults(data: Dict[str, Any]) -> ManualDefaults:
 
 
 def _parse_scheduling(data: Dict[str, Any]) -> SchedulingConfig:
-    auto_enabled = data.get("auto_enabled", True)
     giveaways_raw = data.get("giveaways", [])
     if not isinstance(giveaways_raw, list):
         raise ConfigError("scheduling.giveaways must be a list.")
+
+    auto_enabled_default = bool(giveaways_raw)
+    auto_enabled = bool(data.get("auto_enabled", auto_enabled_default))
 
     giveaways: List[ScheduledGiveawayConfig] = []
     seen_ids: set[str] = set()
@@ -115,7 +117,12 @@ def _parse_scheduling(data: Dict[str, Any]) -> SchedulingConfig:
         try:
             giveaway_id = str(_require(entry, "id"))
             enabled = bool(entry.get("enabled", True))
-            channel_id = int(_require(entry, "channel_id"))
+            channel_id_raw = entry.get("channel_id")
+            channel_id = None
+            if channel_id_raw not in (None, ""):
+                channel_id = int(channel_id_raw)
+                if channel_id <= 0:
+                    raise ValueError
             winners = int(_require(entry, "winners"))
             title = str(_require(entry, "title"))
             description = str(_require(entry, "description"))

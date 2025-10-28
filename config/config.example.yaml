@@ -8,15 +8,15 @@ logging:
 manual_defaults:
     duration_minutes: 1440
 scheduling:
-    auto_enabled: true
-    giveaways:
-        - id: "daily_gift"
-          enabled: true
-          channel_id: 123456789012345678
-          winners: 1
-          title: "Daily Giveaway"
-          description: "Join the daily giveaway!"
-          start_time: "09:00" # HH:MM 24-hour format
-          end_time: "21:00" # HH:MM 24-hour format
+    auto_enabled: false
+    giveaways: []  # Configure scheduled giveaways here (optional)
+    # - id: "daily_gift"
+    #   enabled: true
+    #   channel_id: 123456789012345678
+    #   winners: 1
+    #   title: "Daily Giveaway"
+    #   description: "Join the daily giveaway!"
+    #   start_time: "09:00"  # HH:MM 24-hour format
+    #   end_time: "21:00"    # HH:MM 24-hour format
 permissions:
-    admin_roles: [] # Role IDs that may manage giveaways. Empty allows Manage Guild permission instead.
+    admin_roles: [] # Optional initial role IDs; prefer managing via /giveaway-add-admin-role.

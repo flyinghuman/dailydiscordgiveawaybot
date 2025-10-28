@@ -3,3 +3,4 @@ __pycache__/
 .pytest_cache/
 config/config.yaml
 data/state.json
+logs/

@@ -45,6 +45,16 @@ class GiveawayManager:
             self.config.scheduling.auto_enabled and self.state.auto_enabled
         )
 
+        # Seed admin roles from config if none persisted yet
+        if not self.state.admin_roles and self.config.permissions.admin_roles:
+            unique_roles = []
+            for role_id in self.config.permissions.admin_roles:
+                role_id_int = int(role_id)
+                if role_id_int not in unique_roles:
+                    unique_roles.append(role_id_int)
+            self.state.admin_roles = unique_roles
+            await self.save_state()
+
         await self._restore_active_giveaways()
 
     async def _restore_active_giveaways(self) -> None:
@@ -57,12 +67,30 @@ class GiveawayManager:
         await self.storage.save(self.state)
 
     def is_admin(self, member: discord.Member) -> bool:
-        if member.guild_permissions.manage_guild:
+        if member.guild.owner_id == member.id:
+            log.debug("Member %s is guild owner; treating as giveaway admin.", member.id)
             return True
-        admin_roles = set(self.config.permissions.admin_roles)
+        if member.guild_permissions.manage_guild:
+            log.debug("Member %s has Manage Guild; treating as giveaway admin.", member.id)
+            return True
+        admin_roles = set(self.state.admin_roles)
+        if not admin_roles and self.config.permissions.admin_roles:
+            admin_roles = set(int(r) for r in self.config.permissions.admin_roles)
         if not admin_roles:
+            log.debug("No giveaway admin roles configured; denying member %s.", member.id)
             return False
-        return any(role.id in admin_roles for role in member.roles)
+        for role in member.roles:
+            if role.id in admin_roles:
+                log.debug("Member %s matched giveaway admin role %s.", member.id, role.id)
+                return True
+        role_ids = [role.id for role in member.roles]
+        log.debug(
+            "Member %s lacks required giveaway admin roles %s (has %s).",
+            member.id,
+            sorted(admin_roles),
+            role_ids,
+        )
+        return False
 
     async def start_giveaway(
         self,
@@ -219,6 +247,28 @@ class GiveawayManager:
             await self.save_state()
             return self.state.auto_enabled
 
+    async def add_admin_role(self, role_id: int) -> bool:
+        async with self._state_lock:
+            if role_id in self.state.admin_roles:
+                return False
+            self.state.admin_roles.append(role_id)
+            await self.save_state()
+        await self._notify_logger(f"Role <@&{role_id}> added to giveaway administrators.")
+        return True
+
+    async def remove_admin_role(self, role_id: int) -> bool:
+        async with self._state_lock:
+            if role_id not in self.state.admin_roles:
+                return False
+            self.state.admin_roles.remove(role_id)
+            await self.save_state()
+        await self._notify_logger(f"Role <@&{role_id}> removed from giveaway administrators.")
+        return True
+
+    async def list_admin_roles(self) -> list[int]:
+        async with self._state_lock:
+            return list(self.state.admin_roles)
+
     async def update_giveaway(
         self,
         giveaway_id: str,
@@ -320,13 +370,21 @@ class GiveawayManager:
             if active_existing:
                 return
 
-        channel = await self._fetch_text_channel(schedule.channel_id)
+        channel_id = schedule.channel_id
+        if not channel_id:
+            log.debug(
+                "Scheduled giveaway %s skipped because no channel is configured.",
+                schedule.id,
+            )
+            return
+
+        channel = await self._fetch_text_channel(channel_id)
         guild = channel.guild if channel else None
         if not channel or not guild:
-            log.warning(
-                "Scheduled giveaway %s channel %s not found",
+            log.info(
+                "Scheduled giveaway %s channel %s not found; skipping run.",
                 schedule.id,
-                schedule.channel_id,
+                channel_id,
             )
             return
 

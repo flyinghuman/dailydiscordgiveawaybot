@@ -77,6 +77,7 @@ class BotState:
     logger_channel_id: Optional[int] = None
     schedule_runs: dict = field(default_factory=dict)
     giveaways: List[Giveaway] = field(default_factory=list)
+    admin_roles: List[int] = field(default_factory=list)
 
     def to_payload(self) -> dict:
         return {
@@ -84,6 +85,7 @@ class BotState:
             "logger_channel_id": self.logger_channel_id,
             "schedule_runs": self.schedule_runs,
             "giveaways": [g.to_payload() for g in self.giveaways],
+            "admin_roles": self.admin_roles,
         }
 
     @classmethod
@@ -95,6 +97,7 @@ class BotState:
             logger_channel_id=payload.get("logger_channel_id"),
             schedule_runs=dict(payload.get("schedule_runs", {})),
             giveaways=giveaways,
+            admin_roles=[int(r) for r in payload.get("admin_roles", [])],
         )
         return state
 

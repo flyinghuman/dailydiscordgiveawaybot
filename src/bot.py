@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
+import re
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfoNotFoundError
@@ -17,21 +18,64 @@ from .giveaway_manager import GiveawayManager
 from .storage import StateStorage
 
 
+CHANNEL_MENTION_RE = re.compile(r"^<#?(\d+)>?$")
+
+
+PERMISSION_LOG = logging.getLogger("giveaway.permissions")
+
+def _resolve_text_channel(guild: discord.Guild, value: str) -> Optional[discord.TextChannel]:
+    if not value:
+        return None
+
+    value = value.strip()
+    match = CHANNEL_MENTION_RE.match(value)
+    channel: Optional[discord.abc.GuildChannel] = None
+    if match:
+        channel_id = int(match.group(1))
+        channel = guild.get_channel(channel_id)
+        if isinstance(channel, discord.TextChannel):
+            return channel
+    if value.isdigit():
+        channel_id = int(value)
+        channel = guild.get_channel(channel_id)
+        if isinstance(channel, discord.TextChannel):
+            return channel
+
+    lookup = value.lstrip("#").lower()
+    for text_channel in guild.text_channels:
+        if text_channel.name.lower() == lookup:
+            return text_channel
+    return None
+
 def configure_logging(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    console_level = getattr(logging, level.upper(), logging.INFO)
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    root_logger = logging.getLogger()
+    for handler in list(root_logger.handlers):
+        root_logger.removeHandler(handler)
+
+    root_logger.setLevel(logging.DEBUG)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(console_level)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+
+    log_dir = Path("logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(log_dir / "log.txt", encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
 
 
 class GiveawayBot(commands.Bot):
     def __init__(self, config: Config, storage: StateStorage) -> None:
         intents = discord.Intents.default()
-        intents.guilds = True
-        intents.members = True
 
         super().__init__(
-            command_prefix="!",
+            command_prefix=commands.when_mentioned,
             intents=intents,
             application_id=config.application_id,
         )
@@ -55,13 +99,63 @@ class GiveawayBot(commands.Bot):
         )  # type: ignore[attr-defined]
 
 
-def admin_required(
+async def admin_required(
     interaction: discord.Interaction, manager: GiveawayManager
 ) -> Optional[str]:
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+    command_name = getattr(getattr(interaction, "command", None), "name", "unknown")
+    user = interaction.user
+    user_id = getattr(user, "id", "unknown")
+
+    guild = interaction.guild
+    if guild is None:
+        PERMISSION_LOG.debug(
+            "Denied command %s for user %s: non-guild context.",
+            command_name,
+            user_id,
+        )
         return "This command can only be used inside a guild."
-    if not manager.is_admin(interaction.user):
+
+    member: Optional[discord.Member]
+    if isinstance(user, discord.Member):
+        member = user
+    else:
+        user_id_value: Optional[int]
+        if isinstance(user_id, int):
+            user_id_value = user_id
+        else:
+            try:
+                user_id_value = int(user_id)
+            except (TypeError, ValueError):
+                user_id_value = None
+
+        member = guild.get_member(user_id_value) if user_id_value is not None else None
+        if member is None and user_id_value is not None:
+            try:
+                member = await guild.fetch_member(user_id_value)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                member = None
+
+    if member is None:
+        PERMISSION_LOG.warning(
+            "Denied command %s for user %s: unable to resolve guild member.",
+            command_name,
+            user_id,
+        )
         return "You do not have permission to manage giveaways."
+
+    if not manager.is_admin(member):
+        member_role_ids = [role.id for role in member.roles]
+        PERMISSION_LOG.warning(
+            "Denied command %s for user %s: missing giveaway admin rights (roles=%s).",
+            command_name,
+            member.id,
+            member_role_ids,
+        )
+        return "You do not have permission to manage giveaways."
+
+    PERMISSION_LOG.debug(
+        "Authorized command %s for user %s.", command_name, member.id
+    )
     return None
 
 
@@ -91,21 +185,35 @@ def register_commands(bot: GiveawayBot) -> None:
 
     @bot.tree.command(name="giveaway-start", description="Start a new giveaway.")
     @app_commands.describe(
-        channel="Channel where the giveaway embed should be posted.",
+        channel="Channel where the giveaway embed should be posted (mention, ID, or name).",
         winners="Number of winners to draw.",
         title="Title for the giveaway embed.",
         description="Description for the giveaway.",
     )
     async def giveaway_start(
         interaction: discord.Interaction,
-        channel: discord.TextChannel,
+        channel: str,
         winners: app_commands.Range[int, 1, 100],
         title: str,
         description: str,
     ) -> None:
-        error = admin_required(interaction, manager)
+        error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
+            return
+
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a guild.", ephemeral=True
+            )
+            return
+
+        target_channel = _resolve_text_channel(interaction.guild, channel)
+        if not target_channel:
+            await interaction.response.send_message(
+                "Could not resolve the provided channel. Use a mention, ID, or exact name.",
+                ephemeral=True,
+            )
             return
 
         await interaction.response.defer(ephemeral=True)
@@ -116,7 +224,7 @@ def register_commands(bot: GiveawayBot) -> None:
 
         giveaway = await manager.start_giveaway(
             guild=interaction.guild,  # type: ignore[arg-type]
-            channel=channel,
+            channel=target_channel,
             winners=winners,
             title=title,
             description=description,
@@ -124,7 +232,7 @@ def register_commands(bot: GiveawayBot) -> None:
         )
 
         await interaction.followup.send(
-            f"Giveaway `{giveaway.id}` created in {channel.mention} and ending at "
+            f"Giveaway `{giveaway.id}` created in {target_channel.mention} and ending at "
             f"{giveaway.end_time.astimezone(manager.timezone):%Y-%m-%d %H:%M %Z}.",
             ephemeral=True,
         )
@@ -132,7 +240,7 @@ def register_commands(bot: GiveawayBot) -> None:
     @bot.tree.command(name="giveaway-end", description="End a giveaway immediately.")
     @app_commands.describe(giveaway_id="Identifier of the giveaway to end.")
     async def giveaway_end(interaction: discord.Interaction, giveaway_id: str) -> None:
-        error = admin_required(interaction, manager)
+        error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
             return
@@ -162,7 +270,7 @@ def register_commands(bot: GiveawayBot) -> None:
         description: Optional[str] = None,
         end_time: Optional[str] = None,
     ) -> None:
-        error = admin_required(interaction, manager)
+        error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
             return
@@ -238,7 +346,7 @@ def register_commands(bot: GiveawayBot) -> None:
     async def giveaway_show_participants(
         interaction: discord.Interaction, giveaway_id: str
     ) -> None:
-        error = admin_required(interaction, manager)
+        error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
             return
@@ -263,7 +371,7 @@ def register_commands(bot: GiveawayBot) -> None:
     async def giveaway_reroll(
         interaction: discord.Interaction, giveaway_id: str
     ) -> None:
-        error = admin_required(interaction, manager)
+        error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
             return
@@ -298,25 +406,124 @@ def register_commands(bot: GiveawayBot) -> None:
     @bot.tree.command(
         name="giveaway-logger", description="Set the giveaway log channel."
     )
-    @app_commands.describe(channel="Channel where log messages should be posted.")
+    @app_commands.describe(
+        channel="Channel where log messages should be posted (mention, ID, or name)."
+    )
     async def giveaway_logger(
-        interaction: discord.Interaction, channel: discord.TextChannel
+        interaction: discord.Interaction, channel: str
     ) -> None:
-        error = admin_required(interaction, manager)
+        error = await admin_required(interaction, manager)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a guild.", ephemeral=True
+            )
+            return
+
+        target_channel = _resolve_text_channel(interaction.guild, channel)
+        if not target_channel:
+            await interaction.response.send_message(
+                "Could not resolve the provided channel. Use a mention, ID, or exact name.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        await manager.set_logger_channel(target_channel.id)
+        await interaction.followup.send(
+            f"Logger channel set to {target_channel.mention}.", ephemeral=True
+        )
+
+    @bot.tree.command(
+        name="giveaway-add-admin-role",
+        description="Allow a role to manage giveaways.",
+    )
+    @app_commands.describe(role="Role to grant giveaway management permissions.")
+    async def giveaway_add_admin_role(
+        interaction: discord.Interaction, role: discord.Role
+    ) -> None:
+        error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
-        await manager.set_logger_channel(channel.id)
+        added = await manager.add_admin_role(role.id)
+        if not added:
+            await interaction.followup.send(
+                f"{role.mention} already has giveaway admin permissions.",
+                ephemeral=True,
+            )
+            return
         await interaction.followup.send(
-            f"Logger channel set to {channel.mention}.", ephemeral=True
+            f"Granted giveaway admin permissions to {role.mention}.",
+            ephemeral=True,
         )
+
+    @bot.tree.command(
+        name="giveaway-remove-admin-role",
+        description="Revoke giveaway management permissions from a role.",
+    )
+    @app_commands.describe(role="Role to revoke giveaway management permissions from.")
+    async def giveaway_remove_admin_role(
+        interaction: discord.Interaction, role: discord.Role
+    ) -> None:
+        error = await admin_required(interaction, manager)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        removed = await manager.remove_admin_role(role.id)
+        if not removed:
+            await interaction.followup.send(
+                f"{role.mention} does not have giveaway admin permissions.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            f"Removed giveaway admin permissions from {role.mention}.",
+            ephemeral=True,
+        )
+
+    @bot.tree.command(
+        name="giveaway-list-admin-roles",
+        description="List all roles allowed to manage giveaways.",
+    )
+    async def giveaway_list_admin_roles(interaction: discord.Interaction) -> None:
+        error = await admin_required(interaction, manager)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a guild.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        role_ids = await manager.list_admin_roles()
+        if not role_ids:
+            await interaction.followup.send(
+                "No extra giveaway admin roles are configured.", ephemeral=True
+            )
+            return
+
+        lines = []
+        for role_id in role_ids:
+            role = interaction.guild.get_role(role_id)
+            if role is not None:
+                lines.append(f"- {role.mention} ({role_id})")
+            else:
+                lines.append(f"- Unknown role ID `{role_id}`")
+
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
 
     @bot.tree.command(
         name="giveaway-enable", description="Enable automatic scheduled giveaways."
     )
     async def giveaway_enable(interaction: discord.Interaction) -> None:
-        error = admin_required(interaction, manager)
+        error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
             return
@@ -328,7 +535,7 @@ def register_commands(bot: GiveawayBot) -> None:
         name="giveaway-disable", description="Disable automatic scheduled giveaways."
     )
     async def giveaway_disable(interaction: discord.Interaction) -> None:
-        error = admin_required(interaction, manager)
+        error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
             return

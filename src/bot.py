@@ -143,8 +143,22 @@ async def admin_required(
         )
         return "You do not have permission to manage giveaways."
 
-    if not manager.is_admin(member):
+    if not manager.is_admin(
+        member,
+        guild_owner_id=getattr(guild, "owner_id", None),
+        base_permissions=getattr(interaction, "permissions", None),
+        role_ids=getattr(member, "_roles", None),
+    ):
         member_role_ids = [role.id for role in member.roles]
+        if not member_role_ids:
+            raw_roles = getattr(member, "_roles", None)
+            if raw_roles:
+                member_role_ids = []
+                for role_id in raw_roles:
+                    try:
+                        member_role_ids.append(int(role_id))
+                    except (TypeError, ValueError):
+                        continue
         PERMISSION_LOG.warning(
             "Denied command %s for user %s: missing giveaway admin rights (roles=%s).",
             command_name,

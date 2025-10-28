@@ -66,29 +66,91 @@ class GiveawayManager:
     async def save_state(self) -> None:
         await self.storage.save(self.state)
 
-    def is_admin(self, member: discord.Member) -> bool:
-        if member.guild.owner_id == member.id:
+    def is_admin(
+        self,
+        member: discord.Member,
+        *,
+        guild_owner_id: Optional[int] = None,
+        base_permissions: Optional[discord.Permissions] = None,
+        role_ids: Optional[Iterable[int]] = None,
+    ) -> bool:
+        owner_id = guild_owner_id
+        if owner_id is None:
+            guild = getattr(member, "guild", None)
+            if guild is not None:
+                owner_id = getattr(guild, "owner_id", None) or getattr(
+                    guild, "_owner_id", None
+                )
+        if owner_id is not None and owner_id == member.id:
             log.debug("Member %s is guild owner; treating as giveaway admin.", member.id)
             return True
-        if member.guild_permissions.manage_guild:
-            log.debug("Member %s has Manage Guild; treating as giveaway admin.", member.id)
+
+        permissions_obj = base_permissions
+        if permissions_obj is None:
+            try:
+                permissions_obj = member.guild_permissions
+            except AttributeError:
+                permissions_obj = None
+        if permissions_obj is None:
+            raw_permissions = getattr(member, "_permissions", None)
+            if raw_permissions is not None:
+                try:
+                    permissions_obj = discord.Permissions(int(raw_permissions))
+                except (TypeError, ValueError):
+                    permissions_obj = None
+        if permissions_obj and (
+            permissions_obj.administrator or permissions_obj.manage_guild
+        ):
+            log.debug(
+                "Member %s has administrative permissions; treating as giveaway admin.",
+                member.id,
+            )
             return True
+
+        effective_role_ids: set[int] = set()
+        if role_ids is not None:
+            for role_id in role_ids:
+                try:
+                    effective_role_ids.add(int(role_id))
+                except (TypeError, ValueError):
+                    continue
+
+        if not effective_role_ids:
+            try:
+                for role in member.roles:
+                    effective_role_ids.add(role.id)
+            except AttributeError:
+                pass
+            if not effective_role_ids:
+                raw_roles = getattr(member, "_roles", None)
+                if raw_roles:
+                    for role_id in raw_roles:
+                        try:
+                            effective_role_ids.add(int(role_id))
+                        except (TypeError, ValueError):
+                            continue
+
         admin_roles = set(self.state.admin_roles)
         if not admin_roles and self.config.permissions.admin_roles:
             admin_roles = set(int(r) for r in self.config.permissions.admin_roles)
         if not admin_roles:
             log.debug("No giveaway admin roles configured; denying member %s.", member.id)
             return False
-        for role in member.roles:
-            if role.id in admin_roles:
-                log.debug("Member %s matched giveaway admin role %s.", member.id, role.id)
-                return True
-        role_ids = [role.id for role in member.roles]
+
+        matching_roles = sorted(admin_roles.intersection(effective_role_ids))
+        if matching_roles:
+            log.debug(
+                "Member %s matched giveaway admin role(s) %s.",
+                member.id,
+                matching_roles,
+            )
+            return True
+
         log.debug(
             "Member %s lacks required giveaway admin roles %s (has %s).",
             member.id,
             sorted(admin_roles),
-            role_ids,
+            sorted(effective_role_ids),
         )
         return False
 

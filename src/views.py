@@ -55,7 +55,12 @@ class GiveawayView(discord.ui.View):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("Guild members only.", ephemeral=True)
             return
-        if not self.manager.is_admin(interaction.user):
+        if not self.manager.is_admin(
+            interaction.user,
+            guild_owner_id=getattr(interaction.guild, "owner_id", None) if interaction.guild else None,
+            base_permissions=getattr(interaction, "permissions", None),
+            role_ids=getattr(interaction.user, "_roles", None),
+        ):
             await interaction.response.send_message(
                 "Only administrators can view the participant list.", ephemeral=True
             )

@@ -504,10 +504,12 @@ class GiveawayManager:
             await channel.send(
                 f"🎉 Giveaway **{giveaway.title}** has ended! Congratulations to {mentions}!"
             )
-        elif notify:
-            await channel.send(
-                f"Giveaway **{giveaway.title}** ended without enough participants."
-            )
+        else:
+            if notify:
+                await channel.send(
+                    f"Giveaway **{giveaway.title}** ended without enough participants."
+                )
+            giveaway.participants.clear()
 
         await self._record_recent_winners(giveaway.guild_id, winners, giveaway.id)
         await self.save_state()
@@ -863,6 +865,10 @@ class GiveawayManager:
                 log.info(
                     "All participants eligible for giveaway %s are within the recent winner cooldown.",
                     giveaway.id,
+                )
+                await self._notify_logger(
+                    f"All participants eligible for giveaway `{giveaway.id}` are within the recent winner cooldown.",
+                    guild_id=giveaway.guild_id,
                 )
                 population = filtered_population
         if winners_count > len(population):

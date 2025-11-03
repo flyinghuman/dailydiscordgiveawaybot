@@ -170,7 +170,7 @@ def configure_logging(level: str) -> None:
     for handler in list(root_logger.handlers):
         root_logger.removeHandler(handler)
 
-    root_logger.setLevel(logging.WARNING)
+    root_logger.setLevel(logging.DEBUG)
 
     console_handler = logging.StreamHandler()
     console_handler.setLevel(console_level)

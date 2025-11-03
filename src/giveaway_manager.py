@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import random
+import secrets
 from datetime import UTC, datetime, timedelta, time
 from typing import Dict, Iterable, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -731,7 +731,8 @@ class GiveawayManager:
             population = [
                 p for p in population if p not in giveaway.last_announced_winners
             ] or population
-        return random.sample(population, winners_count)
+        rng = secrets.SystemRandom()
+        return rng.sample(population, winners_count)
 
     async def _register_view(self, giveaway: Giveaway) -> None:
         view = self._build_view(giveaway.id)

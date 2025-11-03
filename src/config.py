@@ -5,6 +5,7 @@ from datetime import datetime, time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import os
 import yaml
 
 
@@ -72,6 +73,19 @@ def _require(data: Dict[str, Any], key: str) -> Any:
         raise ConfigError(f"Missing required config key: {key}")
     return data[key]
 
+def _resolve_env_value(value: str, key: str) -> str:
+    trimmed = value.strip()
+    if trimmed.startswith("${") and trimmed.endswith("}"):
+        env_name = trimmed[2:-1].strip()
+        if not env_name:
+            raise ConfigError(f"Environment reference for '{key}' is empty.")
+        env_value = os.getenv(env_name)
+        if env_value is None:
+            raise ConfigError(
+                f"Environment variable '{env_name}' referenced by '{key}' is not set."
+            )
+        return env_value
+    return value
 
 def _parse_time(value: str, key: str) -> time:
     try:
@@ -198,7 +212,10 @@ def load_config(path: Path) -> Config:
     if not isinstance(data, dict):
         raise ConfigError("Configuration file must contain a mapping at the root.")
 
-    token = str(_require(data, "token"))
+    token_raw = str(_require(data, "token"))
+    token = _resolve_env_value(token_raw, "token").strip()
+    if not token:
+        raise ConfigError("token must not be empty.")
     application_id = int(_require(data, "application_id"))
     default_timezone = str(data.get("default_timezone", "UTC"))
     logging_cfg = _parse_logging(data.get("logging", {}))

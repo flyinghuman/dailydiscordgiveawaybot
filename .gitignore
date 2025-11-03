@@ -4,3 +4,4 @@ __pycache__/
 config/config.yaml
 data/state.json
 logs/
+.env

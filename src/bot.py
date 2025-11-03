@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-from datetime import UTC, datetime, timedelta
+import os
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -26,6 +27,30 @@ class ChannelResolutionError(RuntimeError):
 
 
 PERMISSION_LOG = logging.getLogger("giveaway.permissions")
+ENV_PATH = Path(".env")
+
+
+def _load_env_file(path: Path = ENV_PATH) -> None:
+    if not path.exists():
+        return
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+        if value and ((value[0] == value[-1]) and value.startswith(("'", '"'))):
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
 
 
 async def _resolve_text_channel(
@@ -259,6 +284,7 @@ async def admin_required(
 
 
 def build_bot(config_path: Path) -> GiveawayBot:
+    _load_env_file()
     config = load_config(config_path)
     configure_logging(config.logging.level)
     storage = StateStorage(Path("data") / "state.json")

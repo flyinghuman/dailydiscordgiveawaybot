@@ -10,7 +10,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import discord
 
 from .config import Config, ScheduledGiveawayConfig
-from .models import BotState, Giveaway, GuildState, PendingGiveaway, RecurringGiveaway
+from .models import (
+    BotState,
+    Giveaway,
+    GuildState,
+    PendingGiveaway,
+    RecentWinner,
+    RecurringGiveaway,
+)
 from .storage import StateStorage
 from .views import GiveawayView
 
@@ -63,6 +70,18 @@ class GiveawayManager:
             if guild_state.timezone != tz_name:
                 guild_state.timezone = tz_name
                 updated = True
+            if guild_state.recent_winner_cooldown_days < 0:
+                guild_state.recent_winner_cooldown_days = 0
+                updated = True
+            if guild_state.recent_winners:
+                retention_days = max(guild_state.recent_winner_cooldown_days, 30)
+                cutoff = datetime.now(tz=UTC) - timedelta(days=retention_days)
+                filtered_recent = [
+                    entry for entry in guild_state.recent_winners if entry.won_at >= cutoff
+                ]
+                if len(filtered_recent) != len(guild_state.recent_winners):
+                    guild_state.recent_winners = filtered_recent
+                    updated = True
 
         if updated:
             await self.save_state()
@@ -123,6 +142,76 @@ class GiveawayManager:
         except ZoneInfoNotFoundError:
             state.timezone = "Europe/Berlin"
             return ZoneInfo("Europe/Berlin")
+
+    async def _get_recent_winner_blocklist(self, guild_id: int) -> set[int]:
+        blocked: set[int] = set()
+        needs_save = False
+        async with self._state_lock:
+            guild_state = self._ensure_guild_state(guild_id)
+            cooldown_enabled = guild_state.recent_winner_cooldown_enabled
+            cooldown_days = max(guild_state.recent_winner_cooldown_days, 0)
+            now = datetime.now(tz=UTC)
+            retention_days = max(cooldown_days, 30)
+            retention_cutoff = now - timedelta(days=retention_days)
+
+            retained: list[RecentWinner] = []
+            if cooldown_enabled and cooldown_days > 0:
+                cooldown_cutoff = now - timedelta(days=cooldown_days)
+            else:
+                cooldown_cutoff = None
+
+            for entry in guild_state.recent_winners:
+                if entry.won_at >= retention_cutoff:
+                    retained.append(entry)
+                    if cooldown_cutoff and entry.won_at >= cooldown_cutoff:
+                        blocked.add(entry.user_id)
+                else:
+                    needs_save = True
+
+            if len(retained) != len(guild_state.recent_winners):
+                guild_state.recent_winners = retained
+                needs_save = True
+
+            if not (cooldown_enabled and cooldown_days > 0):
+                blocked.clear()
+
+        if needs_save:
+            await self.save_state()
+
+        return blocked
+
+    async def _record_recent_winners(
+        self, guild_id: int, winners: Iterable[int], giveaway_id: str
+    ) -> None:
+        winners_list = [int(winner) for winner in winners if winner is not None]
+        if not winners_list:
+            return
+
+        needs_save = False
+        now = datetime.now(tz=UTC)
+        async with self._state_lock:
+            guild_state = self._ensure_guild_state(guild_id)
+            retention_days = max(guild_state.recent_winner_cooldown_days, 30)
+            retention_cutoff = now - timedelta(days=retention_days)
+
+            retained = [
+                entry for entry in guild_state.recent_winners if entry.won_at >= retention_cutoff
+            ]
+            if len(retained) != len(guild_state.recent_winners):
+                needs_save = True
+            for winner_id in winners_list:
+                retained.append(
+                    RecentWinner(
+                        user_id=winner_id,
+                        giveaway_id=giveaway_id,
+                        won_at=now,
+                    )
+                )
+                needs_save = True
+            guild_state.recent_winners = retained
+
+        if needs_save:
+            await self.save_state()
 
     def is_admin(
         self,
@@ -419,6 +508,7 @@ class GiveawayManager:
                 f"Giveaway **{giveaway.title}** ended without enough participants."
             )
 
+        await self._record_recent_winners(giveaway.guild_id, winners, giveaway.id)
         await self.save_state()
         await self._notify_logger(
             f"Giveaway **{giveaway.title}** (`{giveaway.id}`) finished with {len(winners)} winner(s).",
@@ -597,7 +687,14 @@ class GiveawayManager:
                 return None
             if giveaway.is_active:
                 raise RuntimeError("Cannot reroll an active giveaway.")
-            winners = await self._choose_winners(giveaway, reroll=True)
+
+        winners = await self._choose_winners(giveaway, reroll=True)
+        await self._record_recent_winners(guild_id, winners, giveaway.id)
+
+        async with self._state_lock:
+            giveaway = self.state.get_giveaway(guild_id, giveaway_id)
+            if not giveaway:
+                return None
             giveaway.last_announced_winners = list(winners)
             await self.save_state()
 
@@ -731,6 +828,20 @@ class GiveawayManager:
             population = [
                 p for p in population if p not in giveaway.last_announced_winners
             ] or population
+        blocklist = await self._get_recent_winner_blocklist(giveaway.guild_id)
+        if blocklist:
+            filtered_population = [p for p in population if p not in blocklist]
+            if filtered_population:
+                population = filtered_population
+            else:
+                log.info(
+                    "All participants eligible for giveaway %s are within the recent winner cooldown.",
+                    giveaway.id,
+                )
+        if winners_count > len(population):
+            winners_count = len(population)
+        if winners_count == 0:
+            return []
         rng = secrets.SystemRandom()
         return rng.sample(population, winners_count)
 
@@ -924,6 +1035,37 @@ class GiveawayManager:
         for recurring in recurring_items:
             if recurring.enabled:
                 await self._schedule_recurring(recurring, reschedule=False)
+
+    async def set_recent_winner_cooldown_days(self, guild_id: int, days: int) -> None:
+        if days < 0:
+            raise ValueError("Cooldown days must be zero or greater.")
+        async with self._state_lock:
+            guild_state = self._ensure_guild_state(guild_id)
+            if guild_state.recent_winner_cooldown_days == days:
+                return
+            guild_state.recent_winner_cooldown_days = days
+            await self.save_state()
+
+    async def set_recent_winner_cooldown_enabled(
+        self, guild_id: int, enabled: bool
+    ) -> bool:
+        async with self._state_lock:
+            guild_state = self._ensure_guild_state(guild_id)
+            if guild_state.recent_winner_cooldown_enabled == enabled:
+                return False
+            guild_state.recent_winner_cooldown_enabled = enabled
+            await self.save_state()
+            return True
+
+    async def get_settings_snapshot(self, guild_id: int) -> dict:
+        async with self._state_lock:
+            guild_state = self._ensure_guild_state(guild_id)
+            return {
+                "timezone": guild_state.timezone,
+                "auto_enabled": guild_state.auto_enabled,
+                "recent_winner_cooldown_days": guild_state.recent_winner_cooldown_days,
+                "recent_winner_cooldown_enabled": guild_state.recent_winner_cooldown_enabled,
+            }
 
     async def get_recurring_giveaway(
         self, guild_id: int, schedule_id: str

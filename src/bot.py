@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import enum
 import logging
 import os
 import re
@@ -28,6 +29,16 @@ class ChannelResolutionError(RuntimeError):
 
 PERMISSION_LOG = logging.getLogger("giveaway.permissions")
 ENV_PATH = Path(".env")
+
+
+class SettingsSetKey(enum.Enum):
+    TIMEZONE = "timezone"
+    RECENT_WINNER_DAYS = "recent_winner_days"
+
+
+class SettingsToggleKey(enum.Enum):
+    RECENT_WINNER_COOLDOWN = "recent_winner_cooldown"
+    AUTO_DAILY = "auto_daily"
 
 
 def _load_env_file(path: Path = ENV_PATH) -> None:
@@ -308,15 +319,18 @@ def _parse_end_time(value: str, tz: ZoneInfo) -> datetime:
 def register_commands(bot: GiveawayBot) -> None:
     manager = bot.manager
 
-    @bot.tree.command(
-        name="giveaway-set-timezone",
-        description="Set the timezone used for giveaways on this server.",
+    settings_group = app_commands.Group(
+        name="giveaway-settings",
+        description="Manage giveaway-wide settings.",
     )
+
+    @settings_group.command(name="set", description="Set a giveaway configuration value.")
     @app_commands.describe(
-        timezone="IANA timezone name, e.g. Europe/Berlin or America/New_York."
+        setting="Which setting to update.",
+        value="New value for the chosen setting. For cooldown days provide an integer. For Time zone provide a valid IANA timezone string (e.g., 'Europe/Berlin').",
     )
-    async def giveaway_set_timezone(
-        interaction: discord.Interaction, timezone: str
+    async def settings_set(
+        interaction: discord.Interaction, setting: SettingsSetKey, value: str
     ) -> None:
         error = await admin_required(interaction, manager)
         if error:
@@ -328,19 +342,178 @@ def register_commands(bot: GiveawayBot) -> None:
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
-        try:
-            await manager.set_timezone(interaction.guild.id, timezone.strip())
-        except ValueError as exc:
-            await interaction.followup.send(str(exc), ephemeral=True)
+        if setting is SettingsSetKey.TIMEZONE:
+            timezone_value = value.strip()
+            try:
+                await manager.set_timezone(interaction.guild.id, timezone_value)
+            except ValueError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+            tz = manager.get_timezone(interaction.guild.id)
+            current_local = datetime.now(tz=tz)
+            await interaction.response.send_message(
+                f"Timezone updated to `{timezone_value}`. Local time is now {current_local:%Y-%m-%d %H:%M %Z}.",
+                ephemeral=True,
+            )
             return
 
-        tz = manager.get_timezone(interaction.guild.id)
-        current_local = datetime.now(tz=tz)
-        await interaction.followup.send(
-            f"Timezone updated to `{timezone.strip()}`. Local time is now {current_local:%Y-%m-%d %H:%M %Z}.",
-            ephemeral=True,
+        if setting is SettingsSetKey.RECENT_WINNER_DAYS:
+            try:
+                days = int(value.strip())
+            except ValueError:
+                await interaction.response.send_message(
+                    "Cooldown days must be a whole number.", ephemeral=True
+                )
+                return
+            if days < 0:
+                await interaction.response.send_message(
+                    "Cooldown days must be zero or greater.", ephemeral=True
+                )
+                return
+            await manager.set_recent_winner_cooldown_days(interaction.guild.id, days)
+            snapshot = await manager.get_settings_snapshot(interaction.guild.id)
+            status = (
+                "enabled"
+                if snapshot["recent_winner_cooldown_enabled"]
+                else "disabled"
+            )
+            await interaction.response.send_message(
+                f"Recent winner cooldown threshold set to {days} day(s). "
+                f"The feature is currently {status}.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            "Unsupported setting selected.", ephemeral=True
         )
+
+    @settings_group.command(name="get", description="Show current giveaway settings.")
+    async def settings_get(interaction: discord.Interaction) -> None:
+        error = await admin_required(interaction, manager)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a guild.", ephemeral=True
+            )
+            return
+        snapshot = await manager.get_settings_snapshot(interaction.guild.id)
+        cooldown_state = (
+            f"Enabled ({snapshot['recent_winner_cooldown_days']} day cooldown)"
+            if snapshot["recent_winner_cooldown_enabled"]
+            else f"Disabled ({snapshot['recent_winner_cooldown_days']} day threshold)"
+        )
+        message = (
+            "Current giveaway settings:\n"
+            f"- Timezone: `{snapshot['timezone']}`\n"
+            f"- Daily automation: {'Enabled' if snapshot['auto_enabled'] else 'Disabled'}\n"
+            f"- Recent winner cooldown: {cooldown_state}"
+        )
+        await interaction.response.send_message(message, ephemeral=True)
+
+    @settings_group.command(
+        name="enable", description="Enable a giveaway feature toggle."
+    )
+    @app_commands.describe(feature="Feature to enable.")
+    async def settings_enable(
+        interaction: discord.Interaction, feature: SettingsToggleKey
+    ) -> None:
+        error = await admin_required(interaction, manager)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a guild.", ephemeral=True
+            )
+            return
+
+        snapshot_before = await manager.get_settings_snapshot(interaction.guild.id)
+
+        if feature is SettingsToggleKey.RECENT_WINNER_COOLDOWN:
+            changed = await manager.set_recent_winner_cooldown_enabled(
+                interaction.guild.id, True
+            )
+            if changed:
+                snapshot = await manager.get_settings_snapshot(interaction.guild.id)
+                await interaction.response.send_message(
+                    f"Recent winner cooldown enabled ({snapshot['recent_winner_cooldown_days']} day threshold).",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "Recent winner cooldown is already enabled.", ephemeral=True
+                )
+            return
+
+        if feature is SettingsToggleKey.AUTO_DAILY:
+            if snapshot_before["auto_enabled"]:
+                await interaction.response.send_message(
+                    "Daily automation is already enabled.", ephemeral=True
+                )
+                return
+            await manager.toggle_auto(interaction.guild.id, True)
+            await interaction.response.send_message(
+                "Daily automation has been enabled.", ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            "Unsupported feature selected.", ephemeral=True
+        )
+
+    @settings_group.command(
+        name="disable", description="Disable a giveaway feature toggle."
+    )
+    @app_commands.describe(feature="Feature to disable.")
+    async def settings_disable(
+        interaction: discord.Interaction, feature: SettingsToggleKey
+    ) -> None:
+        error = await admin_required(interaction, manager)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a guild.", ephemeral=True
+            )
+            return
+
+        snapshot_before = await manager.get_settings_snapshot(interaction.guild.id)
+
+        if feature is SettingsToggleKey.RECENT_WINNER_COOLDOWN:
+            changed = await manager.set_recent_winner_cooldown_enabled(
+                interaction.guild.id, False
+            )
+            if changed:
+                await interaction.response.send_message(
+                    "Recent winner cooldown disabled.", ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    "Recent winner cooldown is already disabled.", ephemeral=True
+                )
+            return
+
+        if feature is SettingsToggleKey.AUTO_DAILY:
+            if not snapshot_before["auto_enabled"]:
+                await interaction.response.send_message(
+                    "Daily automation is already disabled.", ephemeral=True
+                )
+                return
+            await manager.toggle_auto(interaction.guild.id, False)
+            await interaction.response.send_message(
+                "Daily automation has been disabled.", ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            "Unsupported feature selected.", ephemeral=True
+        )
+
+    bot.tree.add_command(settings_group)
 
     @bot.tree.command(name="giveaway-start", description="Start a new giveaway.")
     @app_commands.describe(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, time
+from datetime import UTC, datetime, time
 from typing import Dict, Iterable, List, Optional, Sequence
 
 
@@ -109,6 +109,31 @@ class PendingGiveaway:
 
 
 @dataclass(slots=True)
+class RecentWinner:
+    user_id: int
+    giveaway_id: str
+    won_at: datetime
+
+    def to_payload(self) -> dict:
+        return {
+            "user_id": self.user_id,
+            "giveaway_id": self.giveaway_id,
+            "won_at": self.won_at.isoformat(),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict) -> "RecentWinner":
+        won_at = datetime.fromisoformat(payload["won_at"])
+        if won_at.tzinfo is None:
+            won_at = won_at.replace(tzinfo=UTC)
+        return cls(
+            user_id=int(payload["user_id"]),
+            giveaway_id=str(payload.get("giveaway_id", "")),
+            won_at=won_at,
+        )
+
+
+@dataclass(slots=True)
 class GuildState:
     auto_enabled: bool = True
     timezone: str = "Europe/Berlin"
@@ -118,6 +143,9 @@ class GuildState:
     pending_giveaways: List[PendingGiveaway] = field(default_factory=list)
     recurring_giveaways: List["RecurringGiveaway"] = field(default_factory=list)
     admin_roles: List[int] = field(default_factory=list)
+    recent_winner_cooldown_enabled: bool = False
+    recent_winner_cooldown_days: int = 0
+    recent_winners: List[RecentWinner] = field(default_factory=list)
 
     def to_payload(self) -> dict:
         return {
@@ -129,6 +157,9 @@ class GuildState:
             "pending_giveaways": [p.to_payload() for p in self.pending_giveaways],
             "recurring_giveaways": [r.to_payload() for r in self.recurring_giveaways],
             "admin_roles": self.admin_roles,
+            "recent_winner_cooldown_enabled": self.recent_winner_cooldown_enabled,
+            "recent_winner_cooldown_days": self.recent_winner_cooldown_days,
+            "recent_winners": [entry.to_payload() for entry in self.recent_winners],
         }
 
     @classmethod
@@ -139,6 +170,18 @@ class GuildState:
         pending = [PendingGiveaway.from_payload(p) for p in pending_payload]
         recurring_payload = payload.get("recurring_giveaways", [])
         recurring = [RecurringGiveaway.from_payload(r) for r in recurring_payload]
+        recent_winners_payload = payload.get("recent_winners", [])
+        recent_winners = []
+        for entry in recent_winners_payload:
+            try:
+                recent_winners.append(RecentWinner.from_payload(entry))
+            except Exception:
+                continue
+        try:
+            cooldown_days_value = int(payload.get("recent_winner_cooldown_days", 0) or 0)
+        except (TypeError, ValueError):
+            cooldown_days_value = 0
+
         return cls(
             auto_enabled=bool(payload.get("auto_enabled", True)),
             timezone=payload.get("timezone", "Europe/Berlin"),
@@ -148,6 +191,11 @@ class GuildState:
             pending_giveaways=pending,
             recurring_giveaways=recurring,
             admin_roles=[int(r) for r in payload.get("admin_roles", [])],
+            recent_winner_cooldown_enabled=bool(
+                payload.get("recent_winner_cooldown_enabled", False)
+            ),
+            recent_winner_cooldown_days=cooldown_days_value,
+            recent_winners=recent_winners,
         )
 
 

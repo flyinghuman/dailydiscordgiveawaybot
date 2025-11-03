@@ -870,6 +870,33 @@ class GiveawayManager:
             guild_id=guild_id,
         )
 
+    async def audit_overdue(self) -> None:
+        now = datetime.now(tz=UTC)
+        to_end: list[tuple[int, str]] = []
+        to_finalize: list[tuple[int, str]] = []
+
+        async with self._state_lock:
+            for guild_id, guild_state in self.state.iter_guild_states():
+                for giveaway in guild_state.giveaways:
+                    if giveaway.end_time <= now:
+                        if giveaway.is_active:
+                            to_end.append((guild_id, giveaway.id))
+                        elif (
+                            not giveaway.last_announced_winners
+                            and len(giveaway.participants) > 0
+                        ):
+                            to_finalize.append((guild_id, giveaway.id))
+
+        for guild_id, giveaway_id in to_end:
+            await self.end_giveaway(guild_id, giveaway_id)
+
+        for guild_id, giveaway_id in to_finalize:
+            async with self._state_lock:
+                giveaway = self.state.get_giveaway(guild_id, giveaway_id)
+                if not giveaway or giveaway.last_announced_winners:
+                    continue
+            await self._finalize_giveaway(giveaway, notify=True)
+
     async def set_timezone(self, guild_id: int, timezone_name: str) -> None:
         try:
             ZoneInfo(timezone_name)

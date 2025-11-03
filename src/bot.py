@@ -165,6 +165,7 @@ class GiveawayBot(commands.Bot):
     async def setup_hook(self) -> None:
         await self.manager.load()
         await self.manager.handle_scheduled()
+        await self.manager.audit_overdue()
         self._scheduled_checker.start()
         await self.tree.sync()
         dev_guild_id = self.config.permissions.development_guild_id
@@ -175,6 +176,7 @@ class GiveawayBot(commands.Bot):
     @tasks.loop(minutes=1)
     async def _scheduled_checker(self) -> None:
         await self.manager.handle_scheduled()
+        await self.manager.audit_overdue()
 
     async def on_ready(self) -> None:
         logging.getLogger(__name__).info(

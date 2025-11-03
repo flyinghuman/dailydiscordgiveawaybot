@@ -143,8 +143,11 @@ class GiveawayManager:
             state.timezone = "Europe/Berlin"
             return ZoneInfo("Europe/Berlin")
 
-    async def _get_recent_winner_blocklist(self, guild_id: int) -> set[int]:
+    async def _get_recent_winner_blocklist(
+        self, guild_id: int
+    ) -> tuple[set[int], list[RecentWinner]]:
         blocked: set[int] = set()
+        blocked_entries: list[RecentWinner] = []
         needs_save = False
         async with self._state_lock:
             guild_state = self._ensure_guild_state(guild_id)
@@ -165,6 +168,7 @@ class GiveawayManager:
                     retained.append(entry)
                     if cooldown_cutoff and entry.won_at >= cooldown_cutoff:
                         blocked.add(entry.user_id)
+                        blocked_entries.append(entry)
                 else:
                     needs_save = True
 
@@ -174,11 +178,13 @@ class GiveawayManager:
 
             if not (cooldown_enabled and cooldown_days > 0):
                 blocked.clear()
+                blocked_entries.clear()
 
         if needs_save:
             await self.save_state()
 
-        return blocked
+        blocked_entries.sort(key=lambda entry: entry.won_at)
+        return blocked, blocked_entries
 
     async def _record_recent_winners(
         self, guild_id: int, winners: Iterable[int], giveaway_id: str
@@ -856,27 +862,63 @@ class GiveawayManager:
             population = [
                 p for p in population if p not in giveaway.last_announced_winners
             ] or population
-        blocklist = await self._get_recent_winner_blocklist(giveaway.guild_id)
-        if blocklist:
-            filtered_population = [p for p in population if p not in blocklist]
-            if filtered_population:
-                population = filtered_population
-            else:
+        blocklist, blocked_entries = await self._get_recent_winner_blocklist(
+            giveaway.guild_id
+        )
+
+        eligible_population = (
+            [p for p in population if p not in blocklist]
+            if blocklist
+            else list(population)
+        )
+
+        if blocklist and not eligible_population:
+            log.info(
+                "All participants eligible for giveaway %s are within the recent winner cooldown.",
+                giveaway.id,
+            )
+            await self._notify_logger(
+                f"All participants eligible for giveaway `{giveaway.id}` are within the recent winner cooldown.",
+                guild_id=giveaway.guild_id,
+            )
+
+        rng = secrets.SystemRandom()
+        winners: list[int] = []
+
+        if eligible_population and winners_count > 0:
+            eligible_pick = min(winners_count, len(eligible_population))
+            winners.extend(rng.sample(eligible_population, eligible_pick))
+
+        remaining_slots = winners_count - len(winners)
+        if remaining_slots > 0 and blocked_entries:
+            fallback_winners: list[int] = []
+            seen = set(winners)
+            participant_set = set(population)
+            for entry in blocked_entries:
+                user_id = entry.user_id
+                if user_id in seen:
+                    continue
+                if user_id not in participant_set:
+                    continue
+                fallback_winners.append(user_id)
+                seen.add(user_id)
+                if len(fallback_winners) >= remaining_slots:
+                    break
+            if fallback_winners:
                 log.info(
-                    "All participants eligible for giveaway %s are within the recent winner cooldown.",
+                    "Cooldown override for giveaway %s: selecting recent winner(s) %s.",
                     giveaway.id,
+                    ", ".join(str(winner_id) for winner_id in fallback_winners),
                 )
                 await self._notify_logger(
-                    f"All participants eligible for giveaway `{giveaway.id}` are within the recent winner cooldown.",
+                    "Cooldown override applied for giveaway "
+                    f"`{giveaway.id}`. Selected recent winner(s): "
+                    + ", ".join(f"<@{winner_id}>" for winner_id in fallback_winners),
                     guild_id=giveaway.guild_id,
                 )
-                population = filtered_population
-        if winners_count > len(population):
-            winners_count = len(population)
-        if winners_count == 0:
-            return []
-        rng = secrets.SystemRandom()
-        return rng.sample(population, winners_count)
+                winners.extend(fallback_winners)
+
+        return winners
 
     async def _register_view(self, giveaway: Giveaway) -> None:
         view = self._build_view(giveaway.id)

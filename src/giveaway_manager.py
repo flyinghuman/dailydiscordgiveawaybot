@@ -511,10 +511,17 @@ class GiveawayManager:
 
         await self._record_recent_winners(giveaway.guild_id, winners, giveaway.id)
         await self.save_state()
-        await self._notify_logger(
-            f"Giveaway **{giveaway.title}** (`{giveaway.id}`) finished with {len(winners)} winner(s).",
-            guild_id=giveaway.guild_id,
-        )
+        if winners:
+            winner_mentions = ", ".join(f"<@{winner_id}>" for winner_id in winners)
+            log_message = (
+                f"Giveaway **{giveaway.title}** (`{giveaway.id}`) finished with "
+                f"{len(winners)} winner(s): {winner_mentions}."
+            )
+        else:
+            log_message = (
+                f"Giveaway **{giveaway.title}** (`{giveaway.id}`) finished with no winners."
+            )
+        await self._notify_logger(log_message, guild_id=giveaway.guild_id)
 
     async def add_participant(
         self, guild_id: int, giveaway_id: str, user: discord.Member
@@ -709,9 +716,17 @@ class GiveawayManager:
             giveaway.last_announced_winners = list(winners)
             await self.save_state()
 
-        await self._notify_logger(
-            f"Giveaway `{giveaway.id}` rerolled.", guild_id=guild_id
-        )
+        if winners:
+            winner_mentions = ", ".join(f"<@{winner_id}>" for winner_id in winners)
+            await self._notify_logger(
+                f"Giveaway `{giveaway.id}` rerolled. Winners: {winner_mentions}.",
+                guild_id=guild_id,
+            )
+        else:
+            await self._notify_logger(
+                f"Giveaway `{giveaway.id}` rerolled but produced no winners.",  # pragma: no cover
+                guild_id=guild_id,
+            )
         return winners
 
     async def get_giveaway(
@@ -849,6 +864,7 @@ class GiveawayManager:
                     "All participants eligible for giveaway %s are within the recent winner cooldown.",
                     giveaway.id,
                 )
+                population = filtered_population
         if winners_count > len(population):
             winners_count = len(population)
         if winners_count == 0:

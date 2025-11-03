@@ -170,7 +170,7 @@ def configure_logging(level: str) -> None:
     for handler in list(root_logger.handlers):
         root_logger.removeHandler(handler)
 
-    root_logger.setLevel(logging.DEBUG)
+    root_logger.setLevel(logging.WARNING)
 
     console_handler = logging.StreamHandler()
     console_handler.setLevel(console_level)
@@ -313,7 +313,7 @@ def _parse_end_time(value: str, tz: ZoneInfo) -> datetime:
             return naive.replace(tzinfo=tz).astimezone(UTC)
         except ValueError:
             continue
-    raise ValueError("Time must be in 'YYYY-MM-DD HH:MM' (24h) format.")
+    raise ValueError("Time must be in 'HH:MM' (24h) format.")
 
 
 def register_commands(bot: GiveawayBot) -> None:

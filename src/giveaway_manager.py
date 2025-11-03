@@ -568,13 +568,23 @@ class GiveawayManager:
     async def cleanup_finished(self, guild_id: int) -> int:
         async with self._state_lock:
             guild_state = self._ensure_guild_state(guild_id)
+            cooldown_days = max(guild_state.recent_winner_cooldown_days, 0)
+            cutoff = (
+                datetime.now(tz=UTC) - timedelta(days=cooldown_days)
+                if cooldown_days > 0
+                else None
+            )
             remaining: list[Giveaway] = []
             removed: list[Giveaway] = []
             for giveaway in guild_state.giveaways:
                 if giveaway.is_active:
                     remaining.append(giveaway)
-                else:
-                    removed.append(giveaway)
+                    continue
+                if cutoff is not None and giveaway.end_time >= cutoff:
+                    # Keep recently finished giveaways so recent winner cooldown can reference them.
+                    remaining.append(giveaway)
+                    continue
+                removed.append(giveaway)
             if not removed:
                 return 0
             guild_state.giveaways = remaining
@@ -586,7 +596,7 @@ class GiveawayManager:
                 finish_task.cancel()
 
         await self._notify_logger(
-            f"Cleaned up {len(removed)} finished giveaway(s) from history.",
+            f"Cleaned up {len(removed)} finished giveaway(s) older than {cooldown_days} day(s).",
             guild_id=guild_id,
         )
         return len(removed)

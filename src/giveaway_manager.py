@@ -475,7 +475,8 @@ class GiveawayManager:
             await self.save_state()
 
         task = self._finish_tasks.pop(giveaway_id, None)
-        if task:
+        current = asyncio.current_task()
+        if task and task is not current:
             task.cancel()
         await self._finalize_giveaway(giveaway, notify=notify)
         return giveaway

@@ -1,5 +1,7 @@
 # Daily Giveaway Bot – Operator Guide
 
+Looking to use the developer-hosted bot instead of self-hosting? See [hosted_usage.md](hosted_usage.md) for the invite link and quick configuration steps.
+
 ## 1. Prerequisites
 - Python 3.10 or newer with `discord.py` dependencies (see `requirements.txt`).
 - A Discord application/bot with the **applications.commands** scope and **Server Members Intent** enabled.
@@ -97,3 +99,14 @@ Slash commands auto-sync when the bot starts; ensure the bot is invited with `ap
 - Unit tests are not bundled; use careful manual testing via Discord or add tests targeting these modules.
 
 For an at-a-glance overview see the updated `README.md`; refer back to this guide for detailed command usage and configuration advice.
+
+## 10. Creating Your Own Discord Bot Application
+If you prefer to operate your own bot identity instead of using the hosted instance:
+1. Visit the [Discord Developer Portal](https://discord.com/developers/applications) and sign in.
+2. Click **New Application**, provide a name, and confirm.
+3. Under **Bot**, choose **Add Bot** → **Yes, do it!**. Optionally upload an avatar and set a username.
+4. Enable the **SERVER MEMBERS INTENT** and **MESSAGE CONTENT INTENT** (optional but useful for detailed logging) under *Privileged Gateway Intents*.
+5. Copy the **Bot Token**—store it securely, and set it as `DISCORD_TOKEN` in your `.env`.
+6. Under **OAuth2 → General**, note the **Application ID**; place it into `config/config.yaml`.
+7. Under **OAuth2 → URL Generator**, select **bot** and **applications.commands**, pick the permissions the bot needs (or reuse this project’s invite scopes), and copy the generated URL to invite your bot to servers you manage.
+8. After configuring `config/config.yaml` and `.env`, follow the installation and launch steps earlier in this guide to run your personally branded instance.

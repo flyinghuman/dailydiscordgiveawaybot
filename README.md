@@ -1,5 +1,7 @@
 # Daily Giveaway Discord Bot
 
+![Daily Giveaway Bot Logo](docs/logo.png)
+
 Powerful Discord slash-command bot for hosting manual and recurring giveaways with persistent state, rich logging, and fair winner selection.
 
 ## Key Features
@@ -8,6 +10,11 @@ Powerful Discord slash-command bot for hosting manual and recurring giveaways wi
 - **Recent winner cooldowns** that temporarily block past winners, with intelligent fallback to the oldest entrants if participation is thin.
 - **Rich logging** to console, file, and an optional Discord channel—including cooldown overrides and rerolls.
 - **Secure draws** using cryptographically strong randomness.
+
+## Want to Use the Hosted Bot?
+If you only need the bot in your server and do not plan to self-host, simply invite the developer-hosted instance using the link below and follow the quick configuration steps in [docs/hosted_usage.md](docs/hosted_usage.md).
+
+[Invite the Daily Giveaway Bot to your Discord Server](https://discord.com/oauth2/authorize?client_id=1432780049488281662&permissions=277025483840&integration_type=0&scope=bot+applications.commands)
 
 ## Quick Start
 ```bash
@@ -51,6 +58,7 @@ Every command is described in detail—parameters, permission requirements, and 
 - `src/models.py`, `src/storage.py`, `src/config.py` – data models, JSON persistence, YAML parsing.
 - `src/views.py` – Discord UI components.
 - `docs/user_guide.md` – full installation, setup, and command documentation.
+- `docs/hosted_usage.md` – instructions for inviting the hosted bot instance without self-hosting.
 
 ## Logging & State
 - Runtime logs: console and `logs/log.txt`.
@@ -58,3 +66,6 @@ Every command is described in detail—parameters, permission requirements, and 
 - Persistent state: `data/state.json` (gitignored). Do not edit while the bot is running.
 
 For extended instructions—including troubleshooting tips and command walkthroughs—see [docs/user_guide.md](docs/user_guide.md).
+
+### Creating Your Own Discord Bot Identity
+If you prefer a custom-branded bot, follow the step-by-step instructions in the “Creating Your Own Discord Bot Application” section of the [User Guide](docs/user_guide.md#10-creating-your-own-discord-bot-application). It walks through the Discord Developer Portal, enabling intents, generating an invite link, and wiring the token into this project.

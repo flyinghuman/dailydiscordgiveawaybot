@@ -1,3 +1,5 @@
+"""Core giveaway lifecycle management for the Discord bot."""
+
 from __future__ import annotations
 
 import asyncio
@@ -41,6 +43,7 @@ class GiveawayManager:
         self._state_lock = asyncio.Lock()
 
     async def load(self) -> None:
+        """Load persisted state and reschedule any existing giveaways."""
         try:
             self.state = await self.storage.load()
         except Exception as exc:
@@ -91,6 +94,7 @@ class GiveawayManager:
         await self._restore_recurring_giveaways()
 
     async def _restore_pending_giveaways(self) -> None:
+        """Reschedule pending giveaways captured in persisted state."""
         async with self._state_lock:
             pending_items = [
                 pending
@@ -101,6 +105,7 @@ class GiveawayManager:
             await self._schedule_start(pending, reschedule=False)
 
     async def _restore_active_giveaways(self) -> None:
+        """Re-register views and finish timers for active giveaways."""
         async with self._state_lock:
             active_items = [
                 giveaway
@@ -113,6 +118,7 @@ class GiveawayManager:
             await self._schedule_finish(giveaway)
 
     async def _restore_recurring_giveaways(self) -> None:
+        """Restart recurring giveaway tasks based on stored state."""
         async with self._state_lock:
             recurring_items = [
                 recurring
@@ -124,9 +130,11 @@ class GiveawayManager:
             await self._schedule_recurring(recurring, reschedule=False)
 
     async def save_state(self) -> None:
+        """Persist the current bot state to disk."""
         await self.storage.save(self.state)
 
     def _ensure_guild_state(self, guild_id: int) -> GuildState:
+        """Fetch an existing guild state or create one with defaults."""
         state = self.state.ensure_guild_state(
             guild_id, default_admin_roles=self.config.permissions.admin_roles
         )
@@ -135,6 +143,7 @@ class GiveawayManager:
         return state
 
     def get_timezone(self, guild_id: int) -> ZoneInfo:
+        """Return the guild-specific timezone, falling back to defaults when invalid."""
         state = self._ensure_guild_state(guild_id)
         tz_name = state.timezone or self._default_timezone or "Europe/Berlin"
         try:
@@ -146,6 +155,7 @@ class GiveawayManager:
     async def _get_recent_winner_blocklist(
         self, guild_id: int
     ) -> tuple[set[int], list[RecentWinner]]:
+        """Return IDs currently on cooldown along with their sorted history entries."""
         blocked: set[int] = set()
         blocked_entries: list[RecentWinner] = []
         needs_save = False
@@ -189,6 +199,7 @@ class GiveawayManager:
     async def _record_recent_winners(
         self, guild_id: int, winners: Iterable[int], giveaway_id: str
     ) -> None:
+        """Persist newly selected winners and prune history beyond the retention window."""
         winners_list = [int(winner) for winner in winners if winner is not None]
         if not winners_list:
             return
@@ -227,6 +238,7 @@ class GiveawayManager:
         base_permissions: Optional[discord.Permissions] = None,
         role_ids: Optional[Iterable[int]] = None,
     ) -> bool:
+        """Determine whether the provided member may manage giveaways."""
         owner_id = guild_owner_id
         if owner_id is None:
             guild = getattr(member, "guild", None)
@@ -323,6 +335,7 @@ class GiveawayManager:
         start_time: datetime,
         end_time: datetime,
     ) -> PendingGiveaway:
+        """Schedule a manual giveaway to begin at a future time."""
         if winners <= 0:
             raise ValueError("winners must be greater than zero")
         if end_time <= start_time:
@@ -365,6 +378,7 @@ class GiveawayManager:
         end_local: datetime,
         immediate_started: bool,
     ) -> "RecurringGiveaway":
+        """Create or update a recurring giveaway schedule and start it if needed."""
         schedule_id = f"R{self._generate_giveaway_id()}"
         self._ensure_guild_state(guild.id)
         tz = self.get_timezone(guild.id)
@@ -421,6 +435,7 @@ class GiveawayManager:
         end_time: datetime,
         scheduled_id: Optional[str] = None,
     ) -> Giveaway:
+        """Create and persist a live giveaway message with interactive buttons."""
         if winners <= 0:
             raise ValueError("winners must be greater than zero")
 
@@ -471,6 +486,7 @@ class GiveawayManager:
     async def end_giveaway(
         self, guild_id: int, giveaway_id: str, *, notify: bool = True
     ) -> Optional[Giveaway]:
+        """Mark a giveaway as finished and handle winner selection."""
         async with self._state_lock:
             giveaway = self.state.get_giveaway(guild_id, giveaway_id)
             if not giveaway:
@@ -488,6 +504,7 @@ class GiveawayManager:
         return giveaway
 
     async def _finalize_giveaway(self, giveaway: Giveaway, *, notify: bool) -> None:
+        """Run winner selection, update the embed, and broadcast results."""
         channel = await self._fetch_text_channel(giveaway.channel_id)
         if not channel:
             log.warning(
@@ -534,6 +551,7 @@ class GiveawayManager:
     async def add_participant(
         self, guild_id: int, giveaway_id: str, user: discord.Member
     ) -> str:
+        """Add a user to an active giveaway and update associated metadata."""
         async with self._state_lock:
             giveaway = self.state.get_giveaway(guild_id, giveaway_id)
             if not giveaway:
@@ -554,6 +572,7 @@ class GiveawayManager:
     async def remove_participant(
         self, guild_id: int, giveaway_id: str, user: discord.Member
     ) -> str:
+        """Remove a user from a giveaway and refresh the embed."""
         async with self._state_lock:
             giveaway = self.state.get_giveaway(guild_id, giveaway_id)
             if not giveaway:
@@ -572,16 +591,19 @@ class GiveawayManager:
         return "You've left the giveaway."
 
     async def list_giveaways(self, guild_id: int) -> Iterable[Giveaway]:
+        """Return every giveaway (active and finished) for the guild."""
         async with self._state_lock:
             return list(self.state.list_all(guild_id))
 
     async def get_pending_giveaway(
         self, guild_id: int, pending_id: str
     ) -> Optional[PendingGiveaway]:
+        """Retrieve a pending giveaway by id if it exists."""
         async with self._state_lock:
             return self.state.get_pending(guild_id, pending_id)
 
     async def cleanup_finished(self, guild_id: int) -> int:
+        """Remove finished giveaways older than the cooldown window while preserving recent history."""
         async with self._state_lock:
             guild_state = self._ensure_guild_state(guild_id)
             cooldown_days = max(guild_state.recent_winner_cooldown_days, 0)
@@ -618,17 +640,20 @@ class GiveawayManager:
         return len(removed)
 
     async def get_text_channel(self, channel_id: int) -> Optional[discord.TextChannel]:
+        """Fetch a text channel by id using the bot cache or HTTP fallback."""
         return await self._fetch_text_channel(channel_id)
 
     async def set_logger_channel(
         self, guild_id: int, channel_id: Optional[int]
     ) -> None:
+        """Persist the channel used for Discord-based giveaway logging."""
         async with self._state_lock:
             guild_state = self._ensure_guild_state(guild_id)
             guild_state.logger_channel_id = channel_id
             await self.save_state()
 
     async def toggle_auto(self, guild_id: int, enabled: bool) -> bool:
+        """Enable or disable scheduled giveaways for the guild."""
         async with self._state_lock:
             guild_state = self._ensure_guild_state(guild_id)
             guild_state.auto_enabled = enabled
@@ -636,6 +661,7 @@ class GiveawayManager:
             return guild_state.auto_enabled
 
     async def add_admin_role(self, guild_id: int, role_id: int) -> bool:
+        """Grant admin capabilities to a role; return False if already present."""
         async with self._state_lock:
             guild_state = self._ensure_guild_state(guild_id)
             if role_id in guild_state.admin_roles:
@@ -648,6 +674,7 @@ class GiveawayManager:
         return True
 
     async def remove_admin_role(self, guild_id: int, role_id: int) -> bool:
+        """Revoke giveaway administrative privileges from the given role."""
         async with self._state_lock:
             guild_state = self._ensure_guild_state(guild_id)
             if role_id not in guild_state.admin_roles:
@@ -661,6 +688,7 @@ class GiveawayManager:
         return True
 
     async def list_admin_roles(self, guild_id: int) -> list[int]:
+        """Return giveaway administrator role IDs for the guild."""
         async with self._state_lock:
             guild_state = self.state.get_guild_state(guild_id)
             if not guild_state:
@@ -677,6 +705,7 @@ class GiveawayManager:
         description: Optional[str] = None,
         end_time: Optional[datetime] = None,
     ) -> Optional[Giveaway]:
+        """Apply updates to an existing giveaway and reschedule if needed."""
         async with self._state_lock:
             giveaway = self.state.get_giveaway(guild_id, giveaway_id)
             if not giveaway:
@@ -707,6 +736,7 @@ class GiveawayManager:
     async def reroll(
         self, guild_id: int, giveaway_id: str
     ) -> Optional[Iterable[int]]:
+        """Select new winners for a finished giveaway, respecting cooldowns."""
         async with self._state_lock:
             giveaway = self.state.get_giveaway(guild_id, giveaway_id)
             if not giveaway:
@@ -740,10 +770,12 @@ class GiveawayManager:
     async def get_giveaway(
         self, guild_id: int, giveaway_id: str
     ) -> Optional[Giveaway]:
+        """Fetch a giveaway by id using the state snapshot."""
         async with self._state_lock:
             return self.state.get_giveaway(guild_id, giveaway_id)
 
     async def handle_scheduled(self) -> None:
+        """Check configured schedules and start giveaways when their window opens."""
         if not self.config.scheduling.auto_enabled:
             return
 
@@ -801,6 +833,7 @@ class GiveawayManager:
         today_iso: str,
         schedule_runs_snapshot: dict,
     ) -> None:
+        """Start a scheduled giveaway when today's run has not yet been performed."""
         last_run = schedule_runs_snapshot.get(schedule.id)
         if last_run == today_iso:
             return
@@ -842,6 +875,7 @@ class GiveawayManager:
         )
 
     async def _update_embed(self, giveaway: Giveaway) -> None:
+        """Refresh the giveaway message embed to reflect latest state."""
         channel = await self._fetch_text_channel(giveaway.channel_id)
         if not channel:
             return
@@ -853,6 +887,13 @@ class GiveawayManager:
     async def _choose_winners(
         self, giveaway: Giveaway, reroll: bool = False
     ) -> list[int]:
+        """
+        Select winners while respecting the configured cooldown.
+
+        Participants not on cooldown are sampled first; if the giveaway still
+        requires more winners the oldest recent winners who rejoined are added
+        so the giveaway can conclude cleanly.
+        """
         if len(giveaway.participants) == 0:
             return []
         winners_count = min(giveaway.winners, len(giveaway.participants))
@@ -921,12 +962,14 @@ class GiveawayManager:
         return winners
 
     async def _register_view(self, giveaway: Giveaway) -> None:
+        """Attach the persistent Discord view for an active giveaway."""
         view = self._build_view(giveaway.id)
         self.bot.add_view(view, message_id=giveaway.message_id)
 
     async def _schedule_start(
         self, pending: PendingGiveaway, *, reschedule: bool = True
     ) -> None:
+        """Queue an asynchronous task to start the pending giveaway on time."""
         if reschedule and pending.id in self._pending_tasks:
             self._pending_tasks[pending.id].cancel()
 
@@ -953,6 +996,7 @@ class GiveawayManager:
         end_time_value: time,
         reference: Optional[datetime] = None,
     ) -> tuple[datetime, datetime]:
+        """Return the next UTC start/end datetimes for a given schedule definition."""
         tz = self.get_timezone(guild_id)
         if reference is None:
             reference_local = datetime.now(tz=tz)
@@ -969,6 +1013,7 @@ class GiveawayManager:
     async def _schedule_recurring(
         self, recurring: "RecurringGiveaway", *, reschedule: bool = True
     ) -> None:
+        """Schedule the coroutine responsible for kicking off recurring giveaways."""
         if reschedule:
             task = self._recurring_tasks.pop(recurring.id, None)
             if task:
@@ -994,6 +1039,7 @@ class GiveawayManager:
         self._recurring_tasks[recurring.id] = asyncio.create_task(runner())
 
     async def _run_recurring(self, guild_id: int, schedule_id: str) -> None:
+        """Start a recurring giveaway iteration and calculate the next schedule."""
         async with self._state_lock:
             recurring = self.state.get_recurring(guild_id, schedule_id)
         if not recurring or not recurring.enabled:
@@ -1058,6 +1104,7 @@ class GiveawayManager:
         )
 
     async def audit_overdue(self) -> None:
+        """Ensure giveaways that should have finished are processed even after downtime."""
         now = datetime.now(tz=UTC)
         to_end: list[tuple[int, str]] = []
         to_finalize: list[tuple[int, str]] = []
@@ -1085,6 +1132,7 @@ class GiveawayManager:
             await self._finalize_giveaway(giveaway, notify=True)
 
     async def set_timezone(self, guild_id: int, timezone_name: str) -> None:
+        """Update the timezone for a guild and reschedule recurring giveaways."""
         try:
             ZoneInfo(timezone_name)
         except ZoneInfoNotFoundError as exc:
@@ -1112,6 +1160,7 @@ class GiveawayManager:
                 await self._schedule_recurring(recurring, reschedule=False)
 
     async def set_recent_winner_cooldown_days(self, guild_id: int, days: int) -> None:
+        """Update the cooldown length (in days) that keeps past winners temporarily ineligible."""
         if days < 0:
             raise ValueError("Cooldown days must be zero or greater.")
         async with self._state_lock:
@@ -1124,6 +1173,7 @@ class GiveawayManager:
     async def set_recent_winner_cooldown_enabled(
         self, guild_id: int, enabled: bool
     ) -> bool:
+        """Toggle whether the cooldown rule is enforced for the guild."""
         async with self._state_lock:
             guild_state = self._ensure_guild_state(guild_id)
             if guild_state.recent_winner_cooldown_enabled == enabled:
@@ -1133,6 +1183,7 @@ class GiveawayManager:
             return True
 
     async def get_settings_snapshot(self, guild_id: int) -> dict:
+        """Return a lightweight dict of configurable guild settings for display."""
         async with self._state_lock:
             guild_state = self._ensure_guild_state(guild_id)
             return {
@@ -1149,6 +1200,7 @@ class GiveawayManager:
             return self.state.get_recurring(guild_id, schedule_id)
 
     async def disable_recurring(self, guild_id: int, schedule_id: str) -> str:
+        """Disable a recurring giveaway schedule, cancelling any pending tasks."""
         async with self._state_lock:
             recurring = self.state.get_recurring(guild_id, schedule_id)
             if not recurring:
@@ -1167,6 +1219,7 @@ class GiveawayManager:
         return "disabled"
 
     async def enable_recurring(self, guild_id: int, schedule_id: str) -> str:
+        """Enable a recurring giveaway schedule and queue its next run."""
         async with self._state_lock:
             recurring = self.state.get_recurring(guild_id, schedule_id)
             if not recurring:
@@ -1189,6 +1242,7 @@ class GiveawayManager:
         return "enabled"
 
     async def _start_pending_giveaway(self, guild_id: int, pending_id: str) -> None:
+        """Transition a pending giveaway into an active one when its time arrives."""
         async with self._state_lock:
             pending = self.state.get_pending(guild_id, pending_id)
         if not pending:
@@ -1246,6 +1300,7 @@ class GiveawayManager:
     async def _schedule_finish(
         self, giveaway: Giveaway, *, reschedule: bool = False
     ) -> None:
+        """Schedule the completion of an active giveaway at its end time."""
         if reschedule and giveaway.id in self._finish_tasks:
             self._finish_tasks[giveaway.id].cancel()
 
@@ -1271,6 +1326,7 @@ class GiveawayManager:
     async def _notify_logger(
         self, message: str, *, guild_id: Optional[int] = None
     ) -> None:
+        """Send a formatted message to the configured Discord log channel, if any."""
         channel_id: Optional[int] = None
         if guild_id is not None:
             guild_state = self.state.get_guild_state(guild_id)
@@ -1290,6 +1346,7 @@ class GiveawayManager:
     async def _fetch_text_channel(
         self, channel_id: int
     ) -> Optional[discord.TextChannel]:
+        """Fetch a text channel from cache or HTTP, returning None if unavailable."""
         channel = self.bot.get_channel(channel_id)
         if isinstance(channel, discord.TextChannel):
             return channel
@@ -1302,12 +1359,14 @@ class GiveawayManager:
     async def _fetch_message(
         self, channel: discord.TextChannel, message_id: int
     ) -> Optional[discord.Message]:
+        """Fetch a message while gracefully handling missing access or deletion."""
         try:
             return await channel.fetch_message(message_id)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             return None
 
     def _build_view(self, giveaway_id: str) -> GiveawayView:
+        """Create a Discord UI view bound to a giveaway id."""
         return GiveawayView(self, giveaway_id)
 
     def _build_embed(
@@ -1323,6 +1382,7 @@ class GiveawayManager:
         winner_mentions: Optional[str] = None,
         tz: ZoneInfo,
     ) -> discord.Embed:
+        """Create a giveaway embed summarizing status, participation, and timing."""
         embed = discord.Embed(
             title=title,
             description=description,

@@ -1,3 +1,5 @@
+"""Discord slash-command giveaway bot entry point and command registration."""
+
 from __future__ import annotations
 
 import argparse
@@ -32,16 +34,19 @@ ENV_PATH = Path(".env")
 
 
 class SettingsSetKey(enum.Enum):
+    """Enumerates configurable slash-command settings."""
     TIMEZONE = "timezone"
     RECENT_WINNER_DAYS = "recent_winner_days"
 
 
 class SettingsToggleKey(enum.Enum):
+    """Enumerates boolean feature toggles exposed via slash commands."""
     RECENT_WINNER_COOLDOWN = "recent_winner_cooldown"
     AUTO_DAILY = "auto_daily"
 
 
 def _load_env_file(path: Path = ENV_PATH) -> None:
+    """Populate environment variables from a simple KEY=VALUE dotenv file."""
     if not path.exists():
         return
     try:
@@ -71,6 +76,7 @@ async def _resolve_text_channel(
     *,
     resolved: Optional[dict[str, dict]] = None,
 ) -> discord.TextChannel:
+    """Resolve a slash-command input into a valid text channel in the target guild."""
     if not value:
         raise ChannelResolutionError(
             "No channel value was provided. Use a mention, ID, or exact name."
@@ -163,6 +169,7 @@ async def _resolve_text_channel(
     )
 
 def configure_logging(level: str) -> None:
+    """Configure root logging with console and file handlers."""
     console_level = getattr(logging, level.upper(), logging.INFO)
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
@@ -187,6 +194,7 @@ def configure_logging(level: str) -> None:
 
 class GiveawayBot(commands.Bot):
     def __init__(self, config: Config, storage: StateStorage) -> None:
+        """Initialise the Discord bot wrapper and attach the giveaway manager."""
         intents = discord.Intents.default()
 
         super().__init__(
@@ -199,6 +207,7 @@ class GiveawayBot(commands.Bot):
         self.scheduled_task = self._scheduled_checker
 
     async def setup_hook(self) -> None:
+        """Discord lifecycle hook that runs once the client is preparing to connect."""
         await self.manager.load()
         await self.manager.handle_scheduled()
         await self.manager.audit_overdue()
@@ -211,10 +220,12 @@ class GiveawayBot(commands.Bot):
 
     @tasks.loop(minutes=1)
     async def _scheduled_checker(self) -> None:
+        """Loop that executes scheduled giveaways and audits overdue ones."""
         await self.manager.handle_scheduled()
         await self.manager.audit_overdue()
 
     async def on_ready(self) -> None:
+        """Emit an informational log once Discord confirms the bot is ready."""
         logging.getLogger(__name__).info(
             "Logged in as %s (%s)", self.user, self.user.id
         )  # type: ignore[attr-defined]
@@ -223,6 +234,7 @@ class GiveawayBot(commands.Bot):
 async def admin_required(
     interaction: discord.Interaction, manager: GiveawayManager
 ) -> Optional[str]:
+    """Return an error message when the invoking user lacks giveaway admin privileges."""
     command_name = getattr(getattr(interaction, "command", None), "name", "unknown")
     user = interaction.user
     user_id = getattr(user, "id", "unknown")
@@ -295,6 +307,7 @@ async def admin_required(
 
 
 def build_bot(config_path: Path) -> GiveawayBot:
+    """Create a fully configured GiveawayBot instance from the provided config path."""
     _load_env_file()
     config = load_config(config_path)
     configure_logging(config.logging.level)
@@ -306,6 +319,7 @@ def build_bot(config_path: Path) -> GiveawayBot:
 
 
 def _parse_end_time(value: str, tz: ZoneInfo) -> datetime:
+    """Parse an absolute end time string and return a UTC datetime."""
     value = value.strip()
     for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
         try:
@@ -317,6 +331,7 @@ def _parse_end_time(value: str, tz: ZoneInfo) -> datetime:
 
 
 def register_commands(bot: GiveawayBot) -> None:
+    """Attach slash commands and groups to the bot's command tree."""
     manager = bot.manager
 
     settings_group = app_commands.Group(
@@ -332,6 +347,7 @@ def register_commands(bot: GiveawayBot) -> None:
     async def settings_set(
         interaction: discord.Interaction, setting: SettingsSetKey, value: str
     ) -> None:
+        """Update a guild-level configuration value such as timezone or cooldown days."""
         error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
@@ -390,6 +406,7 @@ def register_commands(bot: GiveawayBot) -> None:
 
     @settings_group.command(name="get", description="Show current giveaway settings.")
     async def settings_get(interaction: discord.Interaction) -> None:
+        """Present a summary of current giveaway configuration for the guild."""
         error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
@@ -420,6 +437,7 @@ def register_commands(bot: GiveawayBot) -> None:
     async def settings_enable(
         interaction: discord.Interaction, feature: SettingsToggleKey
     ) -> None:
+        """Enable a boolean feature flag for giveaway operations."""
         error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
@@ -471,6 +489,7 @@ def register_commands(bot: GiveawayBot) -> None:
     async def settings_disable(
         interaction: discord.Interaction, feature: SettingsToggleKey
     ) -> None:
+        """Disable a boolean feature flag for giveaway operations."""
         error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
@@ -535,6 +554,7 @@ def register_commands(bot: GiveawayBot) -> None:
         end: str,
         run_daily: bool = False,
     ) -> None:
+        """Create a giveaway embed and optionally configure a recurring schedule."""
         error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
@@ -673,6 +693,7 @@ def register_commands(bot: GiveawayBot) -> None:
     @bot.tree.command(name="giveaway-end", description="End a giveaway immediately.")
     @app_commands.describe(giveaway_id="Identifier of the giveaway to end.")
     async def giveaway_end(interaction: discord.Interaction, giveaway_id: str) -> None:
+        """End a giveaway immediately and broadcast the result."""
         error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
@@ -709,6 +730,7 @@ def register_commands(bot: GiveawayBot) -> None:
         description: Optional[str] = None,
         end_time: Optional[str] = None,
     ) -> None:
+        """Edit metadata for an existing giveaway, including winner count and timing."""
         error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
@@ -761,6 +783,7 @@ def register_commands(bot: GiveawayBot) -> None:
         name="giveaway-list", description="List all configured giveaways."
     )
     async def giveaway_list(interaction: discord.Interaction) -> None:
+        """Enumerate giveaways with basic status details for administrators."""
         if not interaction.guild:
             await interaction.response.send_message(
                 "This command is guild-only.", ephemeral=True
@@ -794,6 +817,7 @@ def register_commands(bot: GiveawayBot) -> None:
     async def giveaway_show_participants(
         interaction: discord.Interaction, giveaway_id: str
     ) -> None:
+        """List current entrants for a giveaway so admins can audit participation."""
         error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
@@ -824,6 +848,7 @@ def register_commands(bot: GiveawayBot) -> None:
     async def giveaway_reroll(
         interaction: discord.Interaction, giveaway_id: str
     ) -> None:
+        """Draw replacement winners for a completed giveaway."""
         error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
@@ -871,6 +896,7 @@ def register_commands(bot: GiveawayBot) -> None:
     async def giveaway_logger(
         interaction: discord.Interaction, channel: str
     ) -> None:
+        """Persist the logging channel for giveaway lifecycle messages."""
         error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
@@ -913,6 +939,7 @@ def register_commands(bot: GiveawayBot) -> None:
         description="Remove finished giveaways from the bot history.",
     )
     async def giveaway_cleanup(interaction: discord.Interaction) -> None:
+        """Prune finished giveaways older than the cooldown retention window."""
         error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
@@ -941,6 +968,7 @@ def register_commands(bot: GiveawayBot) -> None:
     async def giveaway_show(
         interaction: discord.Interaction, giveaway_id: str
     ) -> None:
+        """Show an embed with detailed metadata about a specific giveaway."""
         error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
@@ -1086,6 +1114,7 @@ def register_commands(bot: GiveawayBot) -> None:
     async def giveaway_add_admin_role(
         interaction: discord.Interaction, role: discord.Role
     ) -> None:
+        """Grant a role the ability to manage giveaways."""
         error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
@@ -1117,6 +1146,7 @@ def register_commands(bot: GiveawayBot) -> None:
     async def giveaway_remove_admin_role(
         interaction: discord.Interaction, role: discord.Role
     ) -> None:
+        """Revoke giveaway management permissions from a role."""
         error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
@@ -1145,6 +1175,7 @@ def register_commands(bot: GiveawayBot) -> None:
         description="List all roles allowed to manage giveaways.",
     )
     async def giveaway_list_admin_roles(interaction: discord.Interaction) -> None:
+        """Display the configured giveaway administrator roles."""
         error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
@@ -1183,6 +1214,7 @@ def register_commands(bot: GiveawayBot) -> None:
     async def giveaway_enable(
         interaction: discord.Interaction, schedule_id: str
     ) -> None:
+        """Turn on a previously configured recurring giveaway."""
         error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
@@ -1231,6 +1263,7 @@ def register_commands(bot: GiveawayBot) -> None:
     async def giveaway_disable(
         interaction: discord.Interaction, schedule_id: str
     ) -> None:
+        """Pause a recurring giveaway schedule until re-enabled."""
         error = await admin_required(interaction, manager)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
@@ -1263,6 +1296,7 @@ def register_commands(bot: GiveawayBot) -> None:
 
 
 async def main() -> None:
+    """Parse CLI arguments, construct the bot instance, and start the Discord client."""
     parser = argparse.ArgumentParser(description="Discord Giveaway Bot")
     parser.add_argument(
         "--config",

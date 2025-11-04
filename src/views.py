@@ -1,10 +1,14 @@
+"""UI views for Discord message components used by the giveaway bot."""
+
 from __future__ import annotations
 
 import discord
 
 
 class GiveawayView(discord.ui.View):
+    """Persistent Discord view exposing join, leave, and info buttons."""
     def __init__(self, manager, giveaway_id: str) -> None:
+        """Initialise the view for a specific giveaway id."""
         super().__init__(timeout=None)
         self.manager = manager
         self.giveaway_id = giveaway_id
@@ -34,6 +38,7 @@ class GiveawayView(discord.ui.View):
         self.add_item(info_button)
 
     async def join_callback(self, interaction: discord.Interaction) -> None:
+        """Handle a join button press by enlisting the interacting member."""
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message(
                 "You can only join giveaways from a guild.", ephemeral=True
@@ -47,6 +52,7 @@ class GiveawayView(discord.ui.View):
         await interaction.response.send_message(response, ephemeral=True)
 
     async def leave_callback(self, interaction: discord.Interaction) -> None:
+        """Handle a leave button press by removing the interacting member."""
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message(
                 "You must be part of the guild to leave the giveaway.", ephemeral=True
@@ -60,6 +66,7 @@ class GiveawayView(discord.ui.View):
         await interaction.response.send_message(response, ephemeral=True)
 
     async def info_callback(self, interaction: discord.Interaction) -> None:
+        """Handle the info button by sending administrators a participant roster."""
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("Guild members only.", ephemeral=True)
             return

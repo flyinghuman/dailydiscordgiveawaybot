@@ -1,3 +1,5 @@
+"""Data models used for Giveaway persistence and runtime state."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -7,6 +9,7 @@ from typing import Dict, Iterable, List, Optional, Sequence
 
 @dataclass(slots=True)
 class Giveaway:
+    """Represents an active or finished giveaway along with participants and metadata."""
     id: str
     guild_id: int
     channel_id: int
@@ -22,18 +25,21 @@ class Giveaway:
     last_announced_winners: List[int] = field(default_factory=list)
 
     def add_participant(self, user_id: int) -> bool:
+        """Add a participant if they are not already in the list."""
         if user_id in self.participants:
             return False
         self.participants.append(user_id)
         return True
 
     def remove_participant(self, user_id: int) -> bool:
+        """Remove a participant if present."""
         if user_id not in self.participants:
             return False
         self.participants.remove(user_id)
         return True
 
     def to_payload(self) -> dict:
+        """Serialize the giveaway to a JSON-serialisable structure."""
         return {
             "id": self.id,
             "guild_id": self.guild_id,
@@ -52,6 +58,7 @@ class Giveaway:
 
     @classmethod
     def from_payload(cls, payload: dict) -> "Giveaway":
+        """Reconstruct a Giveaway from serialized payload data."""
         return cls(
             id=str(payload["id"]),
             guild_id=int(payload["guild_id"]),
@@ -73,6 +80,7 @@ class Giveaway:
 
 @dataclass(slots=True)
 class PendingGiveaway:
+    """Represents a giveaway scheduled to start in the future."""
     id: str
     guild_id: int
     channel_id: int
@@ -83,6 +91,7 @@ class PendingGiveaway:
     end_time: datetime
 
     def to_payload(self) -> dict:
+        """Serialize to a JSON-friendly mapping."""
         return {
             "id": self.id,
             "guild_id": self.guild_id,
@@ -96,6 +105,7 @@ class PendingGiveaway:
 
     @classmethod
     def from_payload(cls, payload: dict) -> "PendingGiveaway":
+        """Deserialize a pending giveaway from stored state."""
         return cls(
             id=str(payload["id"]),
             guild_id=int(payload["guild_id"]),
@@ -110,11 +120,13 @@ class PendingGiveaway:
 
 @dataclass(slots=True)
 class RecentWinner:
+    """Record of a winner used to enforce cooldown rules."""
     user_id: int
     giveaway_id: str
     won_at: datetime
 
     def to_payload(self) -> dict:
+        """Serialize the winner entry for storage."""
         return {
             "user_id": self.user_id,
             "giveaway_id": self.giveaway_id,
@@ -123,6 +135,7 @@ class RecentWinner:
 
     @classmethod
     def from_payload(cls, payload: dict) -> "RecentWinner":
+        """Rehydrate a RecentWinner from stored JSON data."""
         won_at = datetime.fromisoformat(payload["won_at"])
         if won_at.tzinfo is None:
             won_at = won_at.replace(tzinfo=UTC)
@@ -135,6 +148,7 @@ class RecentWinner:
 
 @dataclass(slots=True)
 class GuildState:
+    """Aggregate state for a single guild including giveaways and permissions."""
     auto_enabled: bool = True
     timezone: str = "Europe/Berlin"
     logger_channel_id: Optional[int] = None
@@ -148,6 +162,7 @@ class GuildState:
     recent_winners: List[RecentWinner] = field(default_factory=list)
 
     def to_payload(self) -> dict:
+        """Serialize guild state for persistence."""
         return {
             "auto_enabled": self.auto_enabled,
             "timezone": self.timezone,
@@ -164,6 +179,7 @@ class GuildState:
 
     @classmethod
     def from_payload(cls, payload: dict) -> "GuildState":
+        """Deserialize guild state from JSON-friendly data."""
         giveaways_payload = payload.get("giveaways", [])
         giveaways = [Giveaway.from_payload(g) for g in giveaways_payload]
         pending_payload = payload.get("pending_giveaways", [])
@@ -201,9 +217,11 @@ class GuildState:
 
 @dataclass(slots=True)
 class BotState:
+    """Root container for all guild states tracked by the bot."""
     guilds: Dict[int, GuildState] = field(default_factory=dict)
 
     def to_payload(self) -> dict:
+        """Serialize the entire bot state into a JSON-friendly mapping."""
         return {
             "guilds": {
                 str(guild_id): guild_state.to_payload()
@@ -213,6 +231,7 @@ class BotState:
 
     @classmethod
     def from_payload(cls, payload: dict) -> "BotState":
+        """Deserialize bot state, supporting both new and legacy formats."""
         if "guilds" in payload:
             guilds_payload = payload.get("guilds", {})
             guilds: Dict[int, GuildState] = {}
@@ -272,6 +291,7 @@ class BotState:
     def ensure_guild_state(
         self, guild_id: int, *, default_admin_roles: Optional[Iterable[int]] = None
     ) -> GuildState:
+        """Return an existing guild state or create one with optional default admin roles."""
         state = self.guilds.get(guild_id)
         if state is None:
             roles: List[int] = []
@@ -290,12 +310,15 @@ class BotState:
         return state
 
     def get_guild_state(self, guild_id: int) -> Optional[GuildState]:
+        """Fetch a guild state by ID, returning None when unknown."""
         return self.guilds.get(guild_id)
 
     def iter_guild_states(self) -> Iterable[tuple[int, GuildState]]:
+        """Iterate over (guild_id, state) pairs."""
         return tuple(self.guilds.items())
 
     def upsert_giveaway(self, giveaway: Giveaway) -> None:
+        """Insert or update a giveaway within the appropriate guild state."""
         state = self.ensure_guild_state(giveaway.guild_id)
         for idx, item in enumerate(state.giveaways):
             if item.id == giveaway.id:
@@ -304,6 +327,7 @@ class BotState:
         state.giveaways.append(giveaway)
 
     def remove_giveaway(self, guild_id: int, giveaway_id: str) -> Optional[Giveaway]:
+        """Remove and return a giveaway if it exists."""
         state = self.get_guild_state(guild_id)
         if not state:
             return None
@@ -313,6 +337,7 @@ class BotState:
         return None
 
     def get_giveaway(self, guild_id: int, giveaway_id: str) -> Optional[Giveaway]:
+        """Retrieve a giveaway by ID."""
         state = self.get_guild_state(guild_id)
         if not state:
             return None
@@ -322,18 +347,21 @@ class BotState:
         return None
 
     def list_active(self, guild_id: int) -> List[Giveaway]:
+        """Return giveaways that are still active for the specified guild."""
         state = self.get_guild_state(guild_id)
         if not state:
             return []
         return [g for g in state.giveaways if g.is_active]
 
     def list_all(self, guild_id: int) -> Sequence[Giveaway]:
+        """Return all giveaways tracked for a guild."""
         state = self.get_guild_state(guild_id)
         if not state:
             return ()
         return tuple(state.giveaways)
 
     def get_pending(self, guild_id: int, pending_id: str) -> Optional[PendingGiveaway]:
+        """Fetch a pending giveaway awaiting start."""
         state = self.get_guild_state(guild_id)
         if not state:
             return None
@@ -343,6 +371,7 @@ class BotState:
         return None
 
     def upsert_pending(self, guild_id: int, pending: PendingGiveaway) -> None:
+        """Insert or update a pending giveaway."""
         state = self.ensure_guild_state(guild_id)
         for idx, item in enumerate(state.pending_giveaways):
             if item.id == pending.id:
@@ -351,6 +380,7 @@ class BotState:
         state.pending_giveaways.append(pending)
 
     def remove_pending(self, guild_id: int, pending_id: str) -> Optional[PendingGiveaway]:
+        """Remove a pending giveaway by ID."""
         state = self.get_guild_state(guild_id)
         if not state:
             return None
@@ -360,12 +390,14 @@ class BotState:
         return None
 
     def list_pending(self, guild_id: int) -> Sequence[PendingGiveaway]:
+        """Return all pending giveaways for a guild."""
         state = self.get_guild_state(guild_id)
         if not state:
             return ()
         return tuple(state.pending_giveaways)
 
     def get_recurring(self, guild_id: int, schedule_id: str) -> Optional["RecurringGiveaway"]:
+        """Retrieve a recurring giveaway definition."""
         state = self.get_guild_state(guild_id)
         if not state:
             return None
@@ -375,6 +407,7 @@ class BotState:
         return None
 
     def upsert_recurring(self, guild_id: int, recurring: "RecurringGiveaway") -> None:
+        """Insert or update a recurring giveaway schedule."""
         state = self.ensure_guild_state(guild_id)
         for idx, item in enumerate(state.recurring_giveaways):
             if item.id == recurring.id:
@@ -383,6 +416,7 @@ class BotState:
         state.recurring_giveaways.append(recurring)
 
     def remove_recurring(self, guild_id: int, schedule_id: str) -> Optional["RecurringGiveaway"]:
+        """Delete a recurring schedule if present."""
         state = self.get_guild_state(guild_id)
         if not state:
             return None
@@ -392,6 +426,7 @@ class BotState:
         return None
 
     def list_recurring(self, guild_id: int) -> Sequence["RecurringGiveaway"]:
+        """Return all recurring schedules for a guild."""
         state = self.get_guild_state(guild_id)
         if not state:
             return ()
@@ -400,6 +435,7 @@ class BotState:
 
 @dataclass(slots=True)
 class RecurringGiveaway:
+    """Represents a giveaway template that runs daily within a defined window."""
     id: str
     guild_id: int
     channel_id: int
@@ -413,6 +449,7 @@ class RecurringGiveaway:
     enabled: bool = True
 
     def to_payload(self) -> dict:
+        """Serialize the recurring schedule for storage."""
         return {
             "id": self.id,
             "guild_id": self.guild_id,
@@ -429,6 +466,7 @@ class RecurringGiveaway:
 
     @classmethod
     def from_payload(cls, payload: dict) -> "RecurringGiveaway":
+        """Construct a RecurringGiveaway from persisted data."""
         start_time_value = payload.get("start_time", "00:00")
         end_time_value = payload.get("end_time", "00:00")
         start_time_obj = datetime.strptime(start_time_value, "%H:%M").time()

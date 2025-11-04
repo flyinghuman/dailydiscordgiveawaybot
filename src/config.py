@@ -1,3 +1,5 @@
+"""Configuration parsing utilities for the giveaway bot."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -15,17 +17,20 @@ class ConfigError(RuntimeError):
 
 @dataclass(slots=True)
 class LoggingConfig:
+    """Logging configuration derived from YAML."""
     level: str
     logger_channel_id: Optional[int]
 
 
 @dataclass(slots=True)
 class ManualDefaults:
+    """Defaults applied when creating manual giveaways."""
     duration_minutes: int = 1440
 
 
 @dataclass(slots=True)
 class ScheduledGiveawayConfig:
+    """Represents a configured recurring giveaway entry."""
     id: str
     enabled: bool
     channel_id: Optional[int]
@@ -37,6 +42,7 @@ class ScheduledGiveawayConfig:
 
     @property
     def duration_minutes(self) -> int:
+        """Return the runtime duration in minutes, accommodating overnight spans."""
         start_minutes = self.start_time.hour * 60 + self.start_time.minute
         end_minutes = self.end_time.hour * 60 + self.end_time.minute
         if end_minutes <= start_minutes:
@@ -47,18 +53,21 @@ class ScheduledGiveawayConfig:
 
 @dataclass(slots=True)
 class SchedulingConfig:
+    """Container for recurring giveaway schedules."""
     auto_enabled: bool
     giveaways: List[ScheduledGiveawayConfig]
 
 
 @dataclass(slots=True)
 class PermissionsConfig:
+    """Configured admin roles and development guild for command sync."""
     admin_roles: List[int]
     development_guild_id: Optional[int] = None
 
 
 @dataclass(slots=True)
 class Config:
+    """Top-level configuration object for the bot."""
     token: str
     application_id: int
     default_timezone: str
@@ -69,11 +78,13 @@ class Config:
 
 
 def _require(data: Dict[str, Any], key: str) -> Any:
+    """Fetch a required key from a mapping, raising a ConfigError when missing."""
     if key not in data:
         raise ConfigError(f"Missing required config key: {key}")
     return data[key]
 
 def _resolve_env_value(value: str, key: str) -> str:
+    """Resolve ${ENV} substitutions inside config values."""
     trimmed = value.strip()
     if trimmed.startswith("${") and trimmed.endswith("}"):
         env_name = trimmed[2:-1].strip()
@@ -88,6 +99,7 @@ def _resolve_env_value(value: str, key: str) -> str:
     return value
 
 def _parse_time(value: str, key: str) -> time:
+    """Parse a HH:MM string into a time object or raise ConfigError."""
     try:
         return datetime.strptime(value, "%H:%M").time()
     except ValueError as exc:
@@ -97,6 +109,7 @@ def _parse_time(value: str, key: str) -> time:
 
 
 def _parse_logging(data: Dict[str, Any]) -> LoggingConfig:
+    """Build the logging configuration from YAML data."""
     level = data.get("level", "INFO")
     logger_channel_id = data.get("logger_channel_id")
     if logger_channel_id is not None and not isinstance(logger_channel_id, int):
@@ -107,6 +120,7 @@ def _parse_logging(data: Dict[str, Any]) -> LoggingConfig:
 
 
 def _parse_manual_defaults(data: Dict[str, Any]) -> ManualDefaults:
+    """Parse manual giveaway defaults, validating duration."""
     duration = data.get("duration_minutes", 1440)
     if not isinstance(duration, int) or duration <= 0:
         raise ConfigError(
@@ -116,6 +130,7 @@ def _parse_manual_defaults(data: Dict[str, Any]) -> ManualDefaults:
 
 
 def _parse_scheduling(data: Dict[str, Any]) -> SchedulingConfig:
+    """Parse scheduled giveaways from configuration data."""
     giveaways_raw = data.get("giveaways", [])
     if not isinstance(giveaways_raw, list):
         raise ConfigError("scheduling.giveaways must be a list.")
@@ -173,6 +188,7 @@ def _parse_scheduling(data: Dict[str, Any]) -> SchedulingConfig:
 
 
 def _parse_permissions(data: Dict[str, Any]) -> PermissionsConfig:
+    """Parse role and guild permissions from configuration data."""
     admin_roles_raw = data.get("admin_roles", [])
     if not isinstance(admin_roles_raw, list):
         raise ConfigError("permissions.admin_roles must be a list of role IDs.")
@@ -205,6 +221,7 @@ def _parse_permissions(data: Dict[str, Any]) -> PermissionsConfig:
 
 
 def load_config(path: Path) -> Config:
+    """Load and validate configuration from YAML, resolving environment placeholders."""
     if not path.exists():
         raise ConfigError(f"Config file {path} does not exist.")
 

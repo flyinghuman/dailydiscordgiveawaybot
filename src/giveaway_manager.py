@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 from datetime import UTC, datetime, timedelta, time
 from typing import Dict, Iterable, Optional
@@ -151,6 +152,13 @@ class GiveawayManager:
         except ZoneInfoNotFoundError:
             state.timezone = "Europe/Berlin"
             return ZoneInfo("Europe/Berlin")
+
+    @staticmethod
+    def _sanitize_text(value: str) -> str:
+        """Strip control characters and escape Discord mentions to prevent abuse."""
+        cleaned = re.sub(r"[\x00-\x1f\x7f]", "", value)
+        cleaned = cleaned.replace("\u200b", "")
+        return discord.utils.escape_mentions(cleaned)
 
     async def _get_recent_winner_blocklist(
         self, guild_id: int
@@ -348,8 +356,8 @@ class GiveawayManager:
             guild_id=guild.id,
             channel_id=channel.id,
             winners=winners,
-            title=title,
-            description=description,
+            title=self._sanitize_text(title),
+            description=self._sanitize_text(description),
             start_time=start_time.astimezone(UTC),
             end_time=end_time.astimezone(UTC),
         )
@@ -403,8 +411,8 @@ class GiveawayManager:
             guild_id=guild.id,
             channel_id=channel.id,
             winners=winners,
-            title=title,
-            description=description,
+            title=self._sanitize_text(title),
+            description=self._sanitize_text(description),
             start_time=base_start_time,
             end_time=base_end_time,
             next_start=next_start_local,
@@ -442,10 +450,12 @@ class GiveawayManager:
         giveaway_id = self._generate_giveaway_id()
         view = self._build_view(giveaway_id)
         tz = self.get_timezone(guild.id)
+        safe_title = self._sanitize_text(title)
+        safe_description = self._sanitize_text(description)
         embed = self._build_embed(
             giveaway=None,
-            title=title,
-            description=description,
+            title=safe_title,
+            description=safe_description,
             winners=winners,
             participants=0,
             end_time=end_time,
@@ -461,8 +471,8 @@ class GiveawayManager:
             channel_id=channel.id,
             message_id=message.id,
             winners=winners,
-            title=title,
-            description=description,
+            title=safe_title,
+            description=safe_description,
             end_time=end_time.astimezone(UTC),
             created_at=datetime.now(tz=UTC),
             scheduled_id=scheduled_id,

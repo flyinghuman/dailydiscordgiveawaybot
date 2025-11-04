@@ -5,7 +5,7 @@
 Powerful Discord slash-command bot for hosting manual and recurring giveaways with persistent state, rich logging, and fair winner selection.
 
 ## Key Features
-- **Persistent giveaways** backed by `data/state.json`—restart-safe and automatically restored on boot.
+- **Persistent giveaways** stored in per-guild SQLite databases under `data/guilds/`, keeping restarts seamless without large monolithic files.
 - **Recurring & scheduled runs** with per-guild timezone awareness and runtime enable/disable controls.
 - **Recent winner cooldowns** that temporarily block past winners, with intelligent fallback to the oldest entrants if participation is thin.
 - **Rich logging** to console, file, and an optional Discord channel—including cooldown overrides and rerolls.
@@ -63,7 +63,7 @@ Every command is described in detail—parameters, permission requirements, and 
 ## Logging & State
 - Runtime logs: console and `logs/log.txt`.
 - Optional Discord channel logging configurable via `/giveaway-logger` or `config/config.yaml`.
-- Persistent state: `data/state.json` (gitignored). Do not edit while the bot is running.
+- Persistent state: per-guild SQLite files under `data/guilds/` (gitignored). Avoid manual edits while the bot is running; the bot handles migrations from older JSON state automatically.
 
 For extended instructions—including troubleshooting tips and command walkthroughs—see [docs/user_guide.md](docs/user_guide.md).
 

@@ -34,7 +34,7 @@ Key fields:
 - `permissions.admin_roles`: initial role IDs allowed to manage giveaways.
 - `permissions.development_guild_id`: guild to receive development command syncs.
 
-State is persisted to `data/state.json` and should be left alone while the bot runs.
+State is persisted in per-guild SQLite databases under `data/guilds/`; avoid editing these files while the bot is running. On first launch, any legacy `data/state.json` file is migrated automatically and backed up as `state.json.bak`.
 
 ## 4. Launching the Bot
 ```bash
@@ -44,7 +44,7 @@ python -m src.bot --config config/config.yaml
 Slash commands auto-sync when the bot starts; ensure the bot is invited with `applications.commands`.
 
 ## 5. Runtime Behaviour Highlights
-- Giveaways are stored in `data/state.json` to survive restarts.
+- Giveaways are stored in `data/guilds/` SQLite databases to survive restarts.
 - Persistent buttons let members join/leave without chat spam.
 - A *recent winner cooldown* can block past winners for N days; if not enough eligible entrants remain, the bot automatically re-selects the oldest recent winners who re-entered.
 - Scheduled and recurring giveaways are handled even across restarts thanks to background tasks and audits.
@@ -88,7 +88,7 @@ Slash commands auto-sync when the bot starts; ensure the bot is invited with `ap
 - **Commands missing**: ensure the bot has re-synced (restart it) and you invited it with the commands scope.
 - **Timezone errors**: the bot validates against the IANA database; incorrect values raise informative errors.
 - **No winners**: the log channel will contain detailed reasons (e.g. all participants still on cooldown).
-- **State debugging**: never hand-edit `data/state.json` while running. Stop the bot first to avoid corruption.
+- **State debugging**: never hand-edit the SQLite files under `data/guilds/` while running. Stop the bot first to avoid corruption.
 
 ## 9. Development Notes
 - Primary modules:  

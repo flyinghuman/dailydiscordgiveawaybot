@@ -311,7 +311,7 @@ def build_bot(config_path: Path) -> GiveawayBot:
     _load_env_file()
     config = load_config(config_path)
     configure_logging(config.logging.level)
-    storage = StateStorage(Path("data") / "state.json")
+    storage = StateStorage(Path("data"))
     try:
         return GiveawayBot(config, storage)
     except ZoneInfoNotFoundError as exc:

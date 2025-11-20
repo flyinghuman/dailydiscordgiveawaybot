@@ -177,7 +177,7 @@ def configure_logging(level: str) -> None:
     for handler in list(root_logger.handlers):
         root_logger.removeHandler(handler)
 
-    root_logger.setLevel(logging.DEBUG)
+    root_logger.setLevel(console_level)
 
     console_handler = logging.StreamHandler()
     console_handler.setLevel(console_level)
@@ -790,23 +790,41 @@ def register_commands(bot: GiveawayBot) -> None:
             )
             return
         await interaction.response.defer(ephemeral=True)
-        giveaways = await manager.list_giveaways(interaction.guild.id)
-        if not giveaways:
+        guild_id = interaction.guild.id
+        giveaways = await manager.list_giveaways(guild_id)
+        recurring = await manager.list_recurring_giveaways(guild_id)
+        if not giveaways and not recurring:
             await interaction.followup.send(
                 "No giveaways have been created yet.", ephemeral=True
             )
             return
-        tz = manager.get_timezone(interaction.guild.id)
-        lines = []
-        for giveaway in giveaways:
-            status = "Active" if giveaway.is_active else "Finished"
-            end_time = giveaway.end_time.astimezone(tz).strftime(
-                "%Y-%m-%d %H:%M %Z"
-            )
-            lines.append(
-                f"- `{giveaway.id}` • **{giveaway.title}** • {status} • ends {end_time} • "
-                f"{len(giveaway.participants)} participant(s)"
-            )
+        tz = manager.get_timezone(guild_id)
+        lines: list[str] = []
+        if giveaways:
+            lines.append("**Giveaways**")
+            for giveaway in giveaways:
+                status = "Active" if giveaway.is_active else "Finished"
+                end_time = giveaway.end_time.astimezone(tz).strftime(
+                    "%Y-%m-%d %H:%M %Z"
+                )
+                lines.append(
+                    f"- `{giveaway.id}` • **{giveaway.title}** • {status} • "
+                    f"ends {end_time} • {len(giveaway.participants)} participant(s)"
+                )
+        if recurring:
+            if lines:
+                lines.append("")
+            lines.append("**Recurring Giveaways**")
+            for schedule in recurring:
+                status = "Enabled" if schedule.enabled else "Disabled"
+                window = f"{schedule.start_time:%H:%M}–{schedule.end_time:%H:%M}"
+                next_start = schedule.next_start.astimezone(tz).strftime(
+                    "%Y-%m-%d %H:%M %Z"
+                )
+                lines.append(
+                    f"- `{schedule.id}` • **{schedule.title}** • {status} • "
+                    f"window {window} • next run {next_start} • channel <#{schedule.channel_id}>"
+                )
         await interaction.followup.send("\n".join(lines), ephemeral=True)
 
     @bot.tree.command(

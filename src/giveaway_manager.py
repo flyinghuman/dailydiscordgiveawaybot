@@ -605,6 +605,14 @@ class GiveawayManager:
         async with self._state_lock:
             return list(self.state.list_all(guild_id))
 
+    async def list_recurring_giveaways(self, guild_id: int) -> Iterable[RecurringGiveaway]:
+        """Return every recurring giveaway schedule for the guild."""
+        async with self._state_lock:
+            state = self.state.get_guild_state(guild_id)
+            if not state:
+                return []
+            return list(state.recurring_giveaways)
+
     async def get_pending_giveaway(
         self, guild_id: int, pending_id: str
     ) -> Optional[PendingGiveaway]:
@@ -945,16 +953,29 @@ class GiveawayManager:
             fallback_winners: list[int] = []
             seen = set(winners)
             participant_set = set(population)
+
+            # Determine the most recent win timestamp per blocked participant so we
+            # can prefer the user who has waited the longest since their last win.
+            last_win_map: dict[int, datetime] = {}
             for entry in blocked_entries:
                 user_id = entry.user_id
-                if user_id in seen:
+                if user_id in seen or user_id not in participant_set:
                     continue
-                if user_id not in participant_set:
+                last_win = last_win_map.get(user_id)
+                if last_win is None or entry.won_at > last_win:
+                    last_win_map[user_id] = entry.won_at
+
+            ordered_candidates = sorted(
+                last_win_map.items(), key=lambda item: item[1]
+            )
+            for user_id, _ in ordered_candidates:
+                if user_id in seen:
                     continue
                 fallback_winners.append(user_id)
                 seen.add(user_id)
                 if len(fallback_winners) >= remaining_slots:
                     break
+
             if fallback_winners:
                 log.info(
                     "Cooldown override for giveaway %s: selecting recent winner(s) %s.",
